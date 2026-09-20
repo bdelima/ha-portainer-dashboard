@@ -1,11 +1,11 @@
 {
-  "domain": "portainer_maintenance",
-  "name": "Portainer Maintenance",
-  "version": "3.0.0",
-  "documentation": "https://github.com/bdelima/ha-portainer-maintenance",
-  "issue_tracker": "https://github.com/bdelima/ha-portainer-maintenance/issues",
-  "dependencies": ["portainer"],
-  "codeowners": ["@bdelima"],
-  "iot_class": "local_polling",
-  "config_flow": true
+    "domain": "portainer_maintenance",
+    "name": "Portainer Maintenance",
+    "version": "1.0.0",
+    "documentation": "https://github.com/bdelima/ha-portainer-maintenance",
+    "issue_tracker": "https://github.com/bdelima/ha-portainer-maintenance/issues",
+    "dependencies": ["portainer"],
+    "codeowners": ["@bdelima"],
+    "iot_class": "local_polling",
+    "config_flow": true
 }
