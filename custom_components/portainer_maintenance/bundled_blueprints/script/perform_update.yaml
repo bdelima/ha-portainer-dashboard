@@ -1,0 +1,66 @@
+blueprint:
+  name: "Portainer Maintenance: perform update"
+  description: >-
+    The single entry point that actually does an update: recreates the
+    container with a fresh image pull, clears any lingering phone
+    notification for it, then hands off to the confirmation script.
+    Automation 2's branch (live "Update now" tap) and the webapp's
+    install/batch-install actions all call this directly with just an
+    update_entity. Installed automatically by the Portainer Maintenance
+    integration -- this file is regenerated on every integration load, so
+    don't hand-edit this deployed copy.
+
+    IMPORTANT after creating this from the blueprint: HA assigns this
+    script's entity_id from whatever name you give it at creation, not
+    automatically "portainer_perform_update" -- go to this script's
+    settings (cog icon) and set its Entity ID explicitly to
+    "portainer_perform_update", since the merged automation, the webapp's
+    backend, and this design's docs all call it by that exact name.
+  domain: script
+  input:
+    notify_device:
+      name: Notify device
+      description: The mobile_app device this clears notifications on.
+      selector:
+        device:
+          filter:
+            integration: mobile_app
+
+fields:
+  update_entity:
+    name: Update entity
+    description: The update.* entity to install.
+    required: true
+    example: "update.plex_update"
+    selector:
+      entity:
+        domain: update
+
+sequence:
+  - variables:
+      notify_device: !input notify_device
+      notify_service: "{{ 'notify.mobile_app_' ~ device_attr(notify_device, 'name') | slugify }}"
+      container_device_id: "{{ device_id(update_entity) }}"
+      host_name: >
+        {% set walk = namespace(current=container_device_id) %}
+        {% for _ in range(4) %}
+          {% set parent = device_attr(walk.current, 'via_device_id') %}
+          {% if parent %}
+            {% set walk.current = parent %}
+          {% endif %}
+        {% endfor %}
+        {{ device_attr(walk.current, 'name') }}
+      device_name: "{{ state_attr(update_entity, 'friendly_name') }} ({{ host_name }})"
+  - action: portainer.recreate_container
+    data:
+      container_device_id: "{{ container_device_id }}"
+      pull_image: true
+  - action: "{{ notify_service }}"
+    data:
+      message: "clear_notification"
+      data:
+        tag: "{{ update_entity }}"
+  - action: script.portainer_update_done
+    data:
+      device_name: "{{ device_name }}"
+      update_entity: "{{ update_entity }}"
