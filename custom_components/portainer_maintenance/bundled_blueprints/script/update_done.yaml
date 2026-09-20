@@ -1,5 +1,6 @@
+alias: "Portainer Update Done"
 blueprint:
-  name: "Portainer Maintenance: update done"
+  name: "Portainer Update Done"
   description: >-
     Shared finishing logic -- posts the "Update performed" confirmation
     (both a persistent_notification and a real phone push). Called only by
@@ -14,12 +15,15 @@ blueprint:
   domain: script
   input:
     notify_device:
-      name: Notify device
-      description: The mobile_app device to push the "update performed" confirmation to.
+      name: Notify device(s)
+      description: >-
+        The mobile_app device(s) to push the "update performed"
+        confirmation to.
       selector:
         device:
           filter:
             integration: mobile_app
+          multiple: true
 
 fields:
   device_name:
@@ -40,8 +44,8 @@ fields:
 
 sequence:
   - variables:
-      notify_device: !input notify_device
-      notify_service: "{{ 'notify.mobile_app_' ~ device_attr(notify_device, 'name') | slugify }}"
+      notify_devices: !input notify_device
+      notify_services: "{{ notify_devices | map('device_attr', 'name') | map('slugify') | map('regex_replace', '^', 'notify.mobile_app_') | list }}"
   - action: persistent_notification.dismiss
     data:
       notification_id: "portainer_update_{{ update_entity | replace('.', '_') }}"
@@ -50,9 +54,12 @@ sequence:
       notification_id: "portainer_update_{{ update_entity | replace('.', '_') }}"
       title: "Update performed: {{ device_name }}"
       message: "Updated on {{ now().strftime('%Y-%m-%d %H:%M') }}"
-  - action: "{{ notify_service }}"
-    data:
-      title: "Update performed"
-      message: "{{ device_name }} updated on {{ now().strftime('%Y-%m-%d %H:%M') }}."
-      data:
-        tag: "portainer_update_done_{{ update_entity | replace('.', '_') }}"
+  - repeat:
+      for_each: "{{ notify_services }}"
+      sequence:
+        - action: "{{ repeat.item }}"
+          data:
+            title: "Update performed"
+            message: "{{ device_name }} updated on {{ now().strftime('%Y-%m-%d %H:%M') }}."
+            data:
+              tag: "portainer_update_done_{{ update_entity | replace('.', '_') }}"
