@@ -1,0 +1,16 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Portainer Maintenance",
+        "description": "One-time setup. Enter the URL where the Portainer actions webapp is reachable (e.g. https://actions.o.pumapants.cc). This integration registers it as a sidebar panel, installs its automation/script blueprints, computes the notification click-through URL automatically, and exposes the update/trouble/stale tracking sensors.",
+        "data": {
+          "webapp_url": "Webapp URL"
+        }
+      }
+    },
+    "abort": {
+      "already_configured": "Portainer Maintenance is already set up."
+    }
+  }
+}
