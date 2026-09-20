@@ -1,5 +1,6 @@
+alias: "Portainer Maintenance"
 blueprint:
-  name: "Portainer Maintenance: automations (merged)"
+  name: "Portainer Maintenance"
   description: >-
     All six live Portainer automations -- notify on update available,
     handle "Update now", handle "Dismiss", startup recheck for missed
@@ -18,12 +19,15 @@ blueprint:
   domain: automation
   input:
     notify_device:
-      name: Notify device
-      description: The mobile_app device all Portainer notifications go to.
+      name: Notify device(s)
+      description: >-
+        The mobile_app device(s) all Portainer notifications go to. Select
+        more than one to push to multiple phones/tablets.
       selector:
         device:
           filter:
             integration: mobile_app
+          multiple: true
 
 trigger:
   - id: update_available
@@ -44,8 +48,8 @@ trigger:
 
 action:
   - variables:
-      notify_device: !input notify_device
-      notify_service: "{{ 'notify.mobile_app_' ~ device_attr(notify_device, 'name') | slugify }}"
+      notify_devices: !input notify_device
+      notify_services: "{{ notify_devices | map('device_attr', 'name') | map('slugify') | map('regex_replace', '^', 'notify.mobile_app_') | list }}"
   - choose:
       # 1. Notify on container update available
       - conditions:
@@ -68,17 +72,20 @@ action:
                   {% endif %}
                 {% endfor %}
                 {{ device_attr(walk.current, 'name') }}
-          - action: "{{ notify_service }}"
-            data:
-              title: "Update available"
-              message: "{{ trigger.event.data.new_state.attributes.friendly_name }} on {{ host_name }} has a new image ready."
-              data:
-                tag: "{{ trigger.event.data.entity_id }}"
-                actions:
-                  - action: "EXECUTE_UPDATE_{{ trigger.event.data.entity_id }}"
-                    title: "Update now"
-                  - action: "DISMISS_UPDATE_{{ trigger.event.data.entity_id }}"
-                    title: "Dismiss"
+          - repeat:
+              for_each: "{{ notify_services }}"
+              sequence:
+                - action: "{{ repeat.item }}"
+                  data:
+                    title: "Update available"
+                    message: "{{ trigger.event.data.new_state.attributes.friendly_name }} on {{ host_name }} has a new image ready."
+                    data:
+                      tag: "{{ trigger.event.data.entity_id }}"
+                      actions:
+                        - action: "EXECUTE_UPDATE_{{ trigger.event.data.entity_id }}"
+                          title: "Update now"
+                        - action: "DISMISS_UPDATE_{{ trigger.event.data.entity_id }}"
+                          title: "Dismiss"
 
       # 2. Handle "Update now"
       - conditions:
@@ -98,11 +105,14 @@ action:
           - condition: template
             value_template: "{{ trigger.event.data.action.startswith('DISMISS_UPDATE_') }}"
         sequence:
-          - action: "{{ notify_service }}"
-            data:
-              message: "clear_notification"
-              data:
-                tag: "{{ trigger.event.data.action.replace('DISMISS_UPDATE_', '') }}"
+          - repeat:
+              for_each: "{{ notify_services }}"
+              sequence:
+                - action: "{{ repeat.item }}"
+                  data:
+                    message: "clear_notification"
+                    data:
+                      tag: "{{ trigger.event.data.action.replace('DISMISS_UPDATE_', '') }}"
 
       # 5. Startup recheck for missed updates
       - conditions:
@@ -117,14 +127,17 @@ action:
               seconds: 30
           - condition: template
             value_template: "{{ states('sensor.portainer_updates_pending') | int(0) > 0 }}"
-          - action: "{{ notify_service }}"
-            data:
-              title: "Updates available (recheck)"
-              message: >
-                {{ states('sensor.portainer_updates_pending') }} pending update{{ 's' if states('sensor.portainer_updates_pending') | int != 1 else '' }} found at startup. Tap to review.
-              data:
-                tag: "portainer_updates_pending"
-                clickAction: "{{ states('sensor.portainer_actions_url') }}"
+          - repeat:
+              for_each: "{{ notify_services }}"
+              sequence:
+                - action: "{{ repeat.item }}"
+                  data:
+                    title: "Updates available (recheck)"
+                    message: >
+                      {{ states('sensor.portainer_updates_pending') }} pending update{{ 's' if states('sensor.portainer_updates_pending') | int != 1 else '' }} found at startup. Tap to review.
+                    data:
+                      tag: "portainer_updates_pending"
+                      clickAction: "{{ states('sensor.portainer_actions_url') }}"
 
       # 6. Notify on container trouble
       - conditions:
@@ -134,17 +147,20 @@ action:
             value_template: >
               {{ trigger.to_state.state | int(0) > (trigger.from_state.state | int(0) if trigger.from_state else 0) }}
         sequence:
-          - action: "{{ notify_service }}"
-            data:
-              title: "Container trouble"
-              message: >
-                {{ trigger.to_state.state }} container{{ 's' if trigger.to_state.state | int != 1 else '' }} need attention. Tap to review.
-              data:
-                tag: "portainer_container_trouble"
-                priority: high
-                ttl: 0
-                channel: alarm_stream
-                clickAction: "{{ states('sensor.portainer_actions_url') }}"
+          - repeat:
+              for_each: "{{ notify_services }}"
+              sequence:
+                - action: "{{ repeat.item }}"
+                  data:
+                    title: "Container trouble"
+                    message: >
+                      {{ trigger.to_state.state }} container{{ 's' if trigger.to_state.state | int != 1 else '' }} need attention. Tap to review.
+                    data:
+                      tag: "portainer_container_trouble"
+                      priority: high
+                      ttl: 0
+                      channel: alarm_stream
+                      clickAction: "{{ states('sensor.portainer_actions_url') }}"
 
       # 7. Report stale Portainer devices
       - conditions:
@@ -154,11 +170,14 @@ action:
             value_template: >
               {{ trigger.to_state.state | int(0) > (trigger.from_state.state | int(0) if trigger.from_state else 0) }}
         sequence:
-          - action: "{{ notify_service }}"
-            data:
-              title: "Stale Portainer devices"
-              message: >
-                {{ trigger.to_state.state }} device{{ 's' if trigger.to_state.state | int != 1 else '' }} look gone. Tap to review.
-              data:
-                tag: "portainer_stale_devices"
-                clickAction: "{{ states('sensor.portainer_actions_url') }}"
+          - repeat:
+              for_each: "{{ notify_services }}"
+              sequence:
+                - action: "{{ repeat.item }}"
+                  data:
+                    title: "Stale Portainer devices"
+                    message: >
+                      {{ trigger.to_state.state }} device{{ 's' if trigger.to_state.state | int != 1 else '' }} look gone. Tap to review.
+                    data:
+                      tag: "portainer_stale_devices"
+                      clickAction: "{{ states('sensor.portainer_actions_url') }}"
