@@ -1,0 +1,17 @@
+remove_device:
+  name: Remove device
+  description: >-
+    Removes a device from the device registry. Used to clean up stale
+    Portainer devices/stacks that Portainer's own HA integration doesn't
+    clean up on its own (a confirmed open bug: home-assistant/core#155548).
+    This deletes the device outright -- there is no undo. Intended for
+    devices already confirmed stale (all entities unavailable for 12+ hours
+    while the host endpoint is healthy), not general-purpose device removal.
+  fields:
+    device_id:
+      name: Device
+      description: The device_id to remove (not an entity_id).
+      required: true
+      example: "3f9e1c2b4a5d6e7f8091a2b3c4d5e6f7"
+      selector:
+        text:
