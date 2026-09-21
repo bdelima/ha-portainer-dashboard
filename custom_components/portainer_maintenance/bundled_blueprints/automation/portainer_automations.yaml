@@ -108,7 +108,7 @@ action:
           - condition: template
             value_template: "{{ trigger.event.data.action.startswith('EXECUTE_UPDATE_') }}"
         sequence:
-          - action: script.portainer_perform_update
+          - action: portainer_maintenance.perform_update
             data:
               update_entity: "{{ trigger.event.data.action.replace('EXECUTE_UPDATE_', '') }}"
 

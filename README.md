@@ -6,7 +6,8 @@ On setup, this integration:
 
 - Registers `portainer_maintenance.remove_device` — a real service for deleting stale Portainer devices/stacks that HA's own UI can't delete via any documented service (built on the stable `device_registry.async_remove_device()` API).
 - Registers `portainer_maintenance.prune_images` — reclaims disk space by pruning Docker images across every Portainer endpoint this HA instance knows about, discovered automatically from the device registry (no static host list to maintain).
-- Installs its own bundled automation and script blueprints into your Home Assistant config automatically — no manual file copying.
+- Registers `portainer_maintenance.perform_update` and `portainer_maintenance.update_done` — native services (not user-created scripts) for actually installing an update and posting the "update performed" confirmation, notifying whichever mobile_app device(s) you pick during setup. These used to be separate script blueprints requiring you to manually set each script's Entity ID to match what the automation blueprint called by name — an easy step to get wrong, which HA would then report as a cryptic "automation uses an unknown action" error. A native service has no such step to miss.
+- Installs its own bundled automation blueprint into your Home Assistant config automatically — no manual file copying.
 - Registers a sidebar panel (iframe) pointing at your own Portainer-actions webapp, at a fixed path — no dashboard-title guesswork.
 - Computes the notification click-through URL automatically from the webapp URL you enter during setup — no Home Assistant network configuration (Settings → System → Network) required.
 - Exposes three native tracking sensors — `sensor.portainer_updates_pending`, `sensor.portainer_container_trouble`, and `sensor.portainer_stale_devices` — replacing what used to be hand-maintained YAML template sensors.
@@ -22,13 +23,14 @@ On setup, this integration:
 2. Repository: `https://github.com/bdelima/ha-portainer-maintenance`, Category: **Integration**.
 3. Find **Portainer Maintenance** in HACS → Integrations → **+ Explore & Download Repositories**, install it.
 4. **Restart Home Assistant** — new `custom_components` are only loaded at startup.
-5. Settings → Devices & Services → **Add Integration** → search "Portainer Maintenance" → enter your webapp's URL.
-6. Settings → Automations & Scenes → Create Automation → **Use Blueprint** → "Portainer Maintenance: automations (merged)" → pick your notify device.
-7. Settings → Automations & Scenes → Scripts → Add Script → **Use Blueprint** → both "Portainer Maintenance: ..." script blueprints → pick your notify device for each, then set each script's Entity ID explicitly (via its settings cog) to `portainer_perform_update` / `portainer_update_done`.
+5. Settings → Devices & Services → **Add Integration** → search "Portainer Maintenance" → enter your webapp's URL and pick the mobile_app device(s) that should get the "update performed" confirmation push.
+6. Settings → Automations & Scenes → Create Automation → **Use Blueprint** → "Portainer Maintenance: automations (merged)" → pick your notify device(s) (can be the same ones as step 5, or different).
+
+Already on an older version and don't see the notify-device field from step 5? Settings → Devices & Services → Portainer Maintenance → ⋮ → **Reconfigure** adds it to your existing setup without deleting and re-adding the integration.
 
 ## Manual installation (without HACS)
 
-Copy `custom_components/portainer_maintenance/` into your Home Assistant config's `custom_components/` directory, then follow steps 4–7 above.
+Copy `custom_components/portainer_maintenance/` into your Home Assistant config's `custom_components/` directory, then follow steps 4–6 above.
 
 ## License
 

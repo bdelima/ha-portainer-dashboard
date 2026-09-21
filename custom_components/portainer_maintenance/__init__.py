@@ -10,10 +10,26 @@ past "expose one service" into a real maintenance layer on top of the core
    Delete button calls an internal frontend WebSocket command, not a
    documented service.
 
-2. Installs its bundled automation/script blueprints into HA's config dir
+1b. Registers `portainer_maintenance.perform_update` and
+   `portainer_maintenance.update_done` -- native services, not blueprint
+   scripts. These used to be `bundled_blueprints/script/*.yaml`, each
+   requiring the user to create a script instance from the blueprint and
+   then manually override its auto-generated Entity ID to match the exact
+   literal string (`portainer_perform_update` / `portainer_update_done`)
+   the merged automation blueprint calls by name -- an easy step to miss
+   or get wrong, and when missed, HA reports it as an opaque "automation
+   uses an unknown action" repair with no obvious link back to that
+   missed step. A native service has no user-assigned entity_id to get
+   wrong in the first place: it's registered under this fixed domain the
+   moment the integration loads, same as remove_device/prune_images
+   above. The two scripts read who to notify from this config entry's
+   notify_devices (see config_flow.py) instead of a blueprint input,
+   since a plain service call has no blueprint inputs to read from.
+
+2. Installs its bundled automation blueprint into HA's config dir
    automatically (see bundled_blueprints/) -- no more separate SSH deploy
-   step for those. Re-copied on every load, so treat the deployed copies
-   as generated, not hand-editable.
+   step for that. Re-copied on every load, so treat the deployed copy as
+   generated, not hand-editable.
 
 3. Registers an iframe sidebar panel pointing at the Portainer actions
    webapp, at a fixed, known path (PANEL_PATH) -- via the same
@@ -23,10 +39,11 @@ past "expose one service" into a real maintenance layer on top of the core
    "Add Dashboard -> Webpage -> read the random URL from the address bar"
    step entirely.
 
-4. Computes the notification click-through URL automatically from this HA
-   instance's own configured external/internal URL plus the fixed panel
-   path, and exposes it as a read-only sensor (see sensor.py) -- no more
-   typing a URL into a text helper or a config field.
+4. Computes the notification click-through URL automatically from the
+   webapp URL entered during setup, and exposes it as a read-only sensor
+   (see sensor.py) -- no more typing a URL into a text helper or a
+   config field, and no dependency on HA's own external/internal URL
+   (Settings -> System -> Network) being configured.
 
 5. Forwards to the sensor platform, which defines the three tracking
    sensors (updates pending / container trouble / stale devices) as native
@@ -44,13 +61,15 @@ from pathlib import Path
 import voluptuous as vol
 
 import homeassistant.helpers.config_validation as cv
+import homeassistant.util.dt as dt_util
 from homeassistant.components import frontend
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.helpers import device_registry as dr, entity_registry as er
+from homeassistant.util import slugify
 
-from .const import CONF_WEBAPP_URL, DOMAIN, PANEL_ICON, PANEL_PATH, PANEL_TITLE
-from .sensor import _portainer_entity_ids, _walk_to_root
+from .const import CONF_NOTIFY_DEVICES, CONF_WEBAPP_URL, DOMAIN, PANEL_ICON, PANEL_PATH, PANEL_TITLE
+from .sensor import _device_name, _portainer_entity_ids, _walk_to_root
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -67,23 +86,81 @@ SERVICE_PRUNE_IMAGES_SCHEMA = vol.Schema(
     }
 )
 
+SERVICE_PERFORM_UPDATE = "perform_update"
+SERVICE_PERFORM_UPDATE_SCHEMA = vol.Schema({vol.Required("update_entity"): cv.entity_id})
+
+SERVICE_UPDATE_DONE = "update_done"
+SERVICE_UPDATE_DONE_SCHEMA = vol.Schema(
+    {
+        vol.Required("device_name"): cv.string,
+        vol.Required("update_entity"): cv.entity_id,
+    }
+)
+
 BUNDLED_BLUEPRINTS_DIR = Path(__file__).parent / "bundled_blueprints"
 
 # (bundled source, relative to BUNDLED_BLUEPRINTS_DIR) -> (dest, relative to config dir)
+# perform_update/update_done used to be here as script blueprints -- see
+# the module docstring (1b.) for why they're native services now instead.
 BLUEPRINT_FILES = [
     (
         "automation/portainer_automations.yaml",
         f"blueprints/automation/{DOMAIN}/portainer_automations.yaml",
     ),
-    (
-        "script/perform_update.yaml",
-        f"blueprints/script/{DOMAIN}/perform_update.yaml",
-    ),
-    (
-        "script/update_done.yaml",
-        f"blueprints/script/{DOMAIN}/update_done.yaml",
-    ),
 ]
+
+
+def _notify_services_for_entry(hass: HomeAssistant, entry: ConfigEntry) -> list[str]:
+    """notify.mobile_app_<slug> for each device_id in this entry's
+    notify_devices -- the Python equivalent of the Jinja
+    `map('device_attr', 'name') | map('slugify') | ...` chain the
+    automation blueprint uses for its own notify_device input."""
+    device_reg = dr.async_get(hass)
+    services = []
+    for device_id in entry.data.get(CONF_NOTIFY_DEVICES, []):
+        device = device_reg.async_get(device_id)
+        if device is None:
+            continue
+        name = device.name_by_user or device.name
+        if name:
+            services.append(f"notify.mobile_app_{slugify(name)}")
+    return services
+
+
+async def _async_update_done(
+    hass: HomeAssistant, entry: ConfigEntry, device_name: str, update_entity: str
+) -> None:
+    """Shared finishing logic for a completed update: a persistent_notification
+    plus a real phone push to every configured notify device. Used both by
+    the perform_update service and directly as its own service (for parity
+    with the old update_done.yaml script, in case anything else calls it)."""
+    notif_id = f"portainer_update_{update_entity.replace('.', '_')}"
+    now_str = dt_util.now().strftime("%Y-%m-%d %H:%M")
+
+    await hass.services.async_call(
+        "persistent_notification", "dismiss", {"notification_id": notif_id}
+    )
+    await hass.services.async_call(
+        "persistent_notification",
+        "create",
+        {
+            "notification_id": notif_id,
+            "title": f"Update performed: {device_name}",
+            "message": f"Updated on {now_str}",
+        },
+    )
+
+    for service in _notify_services_for_entry(hass, entry):
+        domain, service_name = service.split(".", 1)
+        await hass.services.async_call(
+            domain,
+            service_name,
+            {
+                "title": "Update performed",
+                "message": f"{device_name} updated on {now_str}.",
+                "data": {"tag": f"portainer_update_done_{update_entity.replace('.', '_')}"},
+            },
+        )
 
 
 def _install_blueprints(hass: HomeAssistant) -> None:
@@ -208,6 +285,60 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             schema=SERVICE_PRUNE_IMAGES_SCHEMA,
         )
 
+    async def handle_perform_update(call: ServiceCall) -> None:
+        update_entity = call.data["update_entity"]
+        entity_reg = er.async_get(hass)
+        device_reg = dr.async_get(hass)
+
+        reg_entry = entity_reg.async_get(update_entity)
+        container_device_id = reg_entry.device_id if reg_entry else None
+        if container_device_id is None:
+            raise ValueError(f"No device found for entity '{update_entity}'")
+
+        host_id = _walk_to_root(device_reg, container_device_id)
+        host_name = _device_name(device_reg, host_id) or "unknown host"
+        state = hass.states.get(update_entity)
+        friendly_name = (
+            state.attributes.get("friendly_name", update_entity) if state else update_entity
+        )
+        device_name = f"{friendly_name} ({host_name})"
+
+        await hass.services.async_call(
+            "portainer",
+            "recreate_container",
+            {"container_device_id": container_device_id, "pull_image": True},
+            blocking=True,
+        )
+
+        for service in _notify_services_for_entry(hass, entry):
+            domain, service_name = service.split(".", 1)
+            await hass.services.async_call(
+                domain,
+                service_name,
+                {"message": "clear_notification", "data": {"tag": update_entity}},
+            )
+
+        await _async_update_done(hass, entry, device_name, update_entity)
+
+    if not hass.services.has_service(DOMAIN, SERVICE_PERFORM_UPDATE):
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_PERFORM_UPDATE,
+            handle_perform_update,
+            schema=SERVICE_PERFORM_UPDATE_SCHEMA,
+        )
+
+    async def handle_update_done(call: ServiceCall) -> None:
+        await _async_update_done(hass, entry, call.data["device_name"], call.data["update_entity"])
+
+    if not hass.services.has_service(DOMAIN, SERVICE_UPDATE_DONE):
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_UPDATE_DONE,
+            handle_update_done,
+            schema=SERVICE_UPDATE_DONE_SCHEMA,
+        )
+
     await hass.async_add_executor_job(_install_blueprints, hass)
 
     webapp_url = entry.data[CONF_WEBAPP_URL]
@@ -242,4 +373,6 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if not hass.data[DOMAIN]:
             hass.services.async_remove(DOMAIN, SERVICE_REMOVE_DEVICE)
             hass.services.async_remove(DOMAIN, SERVICE_PRUNE_IMAGES)
+            hass.services.async_remove(DOMAIN, SERVICE_PERFORM_UPDATE)
+            hass.services.async_remove(DOMAIN, SERVICE_UPDATE_DONE)
     return unload_ok
