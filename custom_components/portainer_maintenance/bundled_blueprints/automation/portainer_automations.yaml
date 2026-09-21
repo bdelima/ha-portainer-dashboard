@@ -11,6 +11,23 @@ blueprint:
     Portainer Maintenance integration -- this file is regenerated on every
     integration load, so don't hand-edit this deployed copy.
 
+    Update-available detection triggers off sensor.portainer_updates_pending
+    rather than listening to state_changed system-wide: that sensor's own
+    coordinator already scans the entity registry for every update.*
+    entity under the Portainer integration every 5 minutes and publishes
+    the currently-on ones as its `items` attribute (see sensor.py). This
+    automation just diffs that list against its previous value to find
+    newly-appeared entries. That keeps "notify about ANY current or future
+    update entity" fully automatic with no per-entity selection, while
+    only ever listening to one explicit, cheap entity -- a raw
+    system-wide state_changed event trigger here previously caused two
+    HA lockups (self-retrigger / "Already running" log storms) because it
+    fired on every single state change in the house, not just Portainer's.
+    Tradeoff: update notifications now follow that sensor's 5-minute
+    refresh cadence instead of firing the instant an update.* entity
+    flips -- same cadence the old template-sensor design already used, so
+    not a regression.
+
     Tradeoff accepted by merging: no more independent enable/disable or
     separate trace/history per behavior in the HA UI -- disabling just one
     (e.g. stale-device alerts) means editing this automation's choose
@@ -31,8 +48,8 @@ blueprint:
 
 trigger:
   - id: update_available
-    trigger: event
-    event_type: state_changed
+    trigger: state
+    entity_id: sensor.portainer_updates_pending
   - id: notification_action
     trigger: event
     event_type: mobile_app_notification_action
@@ -51,41 +68,38 @@ action:
       notify_devices: !input notify_device
       notify_services: "{{ notify_devices | map('device_attr', 'name') | map('slugify') | map('regex_replace', '^', 'notify.mobile_app_') | list }}"
   - choose:
-      # 1. Notify on container update available
+      # 1. Notify on newly-appeared update-available entries
+      #    (diffs sensor.portainer_updates_pending's `items` list --
+      #    see the blueprint description for why this isn't a raw
+      #    state_changed listener.)
       - conditions:
           - condition: trigger
             id: update_available
-          - condition: template
-            value_template: >
-              {{ trigger.event.data.entity_id in (integration_entities('portainer') | select('match', 'update\\.') | list)
-                 and trigger.event.data.new_state.state == 'on'
-                 and trigger.event.data.old_state.state != 'on' }}
         sequence:
           - variables:
-              update_entity: "{{ trigger.event.data.entity_id }}"
-              host_name: >
-                {% set walk = namespace(current=device_id(update_entity)) %}
-                {% for _ in range(4) %}
-                  {% set parent = device_attr(walk.current, 'via_device_id') %}
-                  {% if parent %}
-                    {% set walk.current = parent %}
-                  {% endif %}
-                {% endfor %}
-                {{ device_attr(walk.current, 'name') }}
+              old_items: "{{ trigger.from_state.attributes.get('items', []) if trigger.from_state else [] }}"
+              new_items: "{{ trigger.to_state.attributes.get('items', []) if trigger.to_state else [] }}"
+              old_entities: "{{ old_items | map(attribute='entity') | list }}"
+              newly_appeared: "{{ new_items | rejectattr('entity', 'in', old_entities) | list }}"
           - repeat:
-              for_each: "{{ notify_services }}"
+              for_each: "{{ newly_appeared }}"
               sequence:
-                - action: "{{ repeat.item }}"
-                  data:
-                    title: "Update available"
-                    message: "{{ trigger.event.data.new_state.attributes.friendly_name }} on {{ host_name }} has a new image ready."
-                    data:
-                      tag: "{{ trigger.event.data.entity_id }}"
-                      actions:
-                        - action: "EXECUTE_UPDATE_{{ trigger.event.data.entity_id }}"
-                          title: "Update now"
-                        - action: "DISMISS_UPDATE_{{ trigger.event.data.entity_id }}"
-                          title: "Dismiss"
+                - variables:
+                    new_item: "{{ repeat.item }}"
+                - repeat:
+                    for_each: "{{ notify_services }}"
+                    sequence:
+                      - action: "{{ repeat.item }}"
+                        data:
+                          title: "Update available"
+                          message: "{{ new_item.name }} has a new image ready."
+                          data:
+                            tag: "{{ new_item.entity }}"
+                            actions:
+                              - action: "EXECUTE_UPDATE_{{ new_item.entity }}"
+                                title: "Update now"
+                              - action: "DISMISS_UPDATE_{{ new_item.entity }}"
+                                title: "Dismiss"
 
       # 2. Handle "Update now"
       - conditions:
@@ -125,6 +139,16 @@ action:
             continue_on_timeout: true
           - delay:
               seconds: 30
+          # Force our own coordinator to re-scan right now -- its own
+          # first-refresh-at-startup can land before the portainer
+          # integration's update.* entities are actually populated
+          # (manifest.json's dependency only guarantees setup ORDER, not
+          # that those entities have real states yet), which would
+          # otherwise leave this sensor stuck reporting 0 until its next
+          # 5-minute poll.
+          - action: homeassistant.update_entity
+            target:
+              entity_id: sensor.portainer_updates_pending
           - condition: template
             value_template: "{{ states('sensor.portainer_updates_pending') | int(0) > 0 }}"
           - repeat:

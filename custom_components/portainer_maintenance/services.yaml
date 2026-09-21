@@ -15,3 +15,41 @@ remove_device:
       example: "3f9e1c2b4a5d6e7f8091a2b3c4d5e6f7"
       selector:
         text:
+
+prune_images:
+  name: Prune images
+  description: >-
+    Reclaims disk space by pruning Docker images across every Portainer
+    endpoint (host) this HA instance knows about -- discovered
+    automatically from the device registry, same as the tracking sensors,
+    so a newly-added host needs no extra configuration here. Wraps the
+    core portainer.prune_images action, called once per discovered host.
+  fields:
+    dangling:
+      name: Dangling only
+      description: >-
+        Only remove untagged orphan layers (leftovers from rebuilding a
+        locally-built image with the same tag) -- these are never
+        referenced by any container, running or stopped, so this is safe
+        to run anytime with no time buffer. When false, also removes
+        tagged images with zero referencing containers (e.g. left behind
+        by a deleted Portainer stack), subject to until_hours below.
+      required: false
+      default: false
+      selector:
+        boolean:
+    until_hours:
+      name: Unused for at least (hours)
+      description: >-
+        Only applies when dangling is false. Skips a tagged-but-unused
+        image until it's been unused for at least this many hours, so a
+        stack you stop and restart shortly after keeps its cached image
+        instead of losing it to a prune run in between. Leave blank to
+        prune all unused images immediately regardless of age.
+      required: false
+      example: 48
+      selector:
+        number:
+          min: 1
+          max: 8760
+          mode: box
