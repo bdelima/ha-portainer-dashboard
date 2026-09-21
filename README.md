@@ -1,6 +1,6 @@
 # Portainer Maintenance
 
-A Home Assistant custom integration that turns the core [`portainer`](https://www.home-assistant.io/integrations/portainer/) integration into a full review-and-approve maintenance workflow for container updates, container health, and stale-device cleanup — built on top of a companion notification/automation design. See the [full design doc](https://github.com/bdelima/ha-portainer-maintenance/blob/main/docs/portainer-ha-container-management-design.md) for the whole system this integration is one piece of.
+A Home Assistant custom integration that turns the core [`portainer`](https://www.home-assistant.io/integrations/portainer/) integration into a full review-and-approve maintenance workflow for container updates, container health, and stale-device cleanup — built on top of a companion notification/automation design. See the [full design doc](https://github.com/bdelima/ha-portainer-dashboard/blob/main/docs/portainer-ha-container-management-design.md) for the whole system this integration is one piece of.
 
 On setup, this integration:
 
@@ -16,12 +16,12 @@ On setup, this integration:
 ## Requirements
 
 - Home Assistant with the core `portainer` integration already configured against at least one Portainer endpoint.
-- The [Portainer Action Dashboard](https://github.com/bdelima/portainer-action-dashboard) webapp, running as its own Docker container and reachable from Home Assistant — this integration only points a sidebar panel at its URL, it doesn't build, run, or provide that container itself. A prebuilt multi-arch image is published to Docker Hub as [`bdelima/portainer-action-dashboard`](https://hub.docker.com/r/bdelima/portainer-action-dashboard) (`docker pull bdelima/portainer-action-dashboard:latest`); see that repo's README for Compose and `docker run` examples, or to build it from source instead.
+- The [Portainer Sidecar](https://github.com/bdelima/ha-portainer-sidecar) webapp, running as its own Docker container and reachable from Home Assistant — this integration only points a sidebar panel at its URL, it doesn't build, run, or provide that container itself. A prebuilt multi-arch image is published to Docker Hub as [`bdelima/ha-portainer-sidecar`](https://hub.docker.com/r/bdelima/ha-portainer-sidecar) (`docker pull bdelima/ha-portainer-sidecar:latest`); see that repo's README for Compose and `docker run` examples, or to build it from source instead.
 
 ## Installation via HACS
 
 1. HACS → the "⋮" menu (top right) → **Custom repositories**.
-2. Repository: `https://github.com/bdelima/ha-portainer-maintenance`, Category: **Integration**.
+2. Repository: `https://github.com/bdelima/ha-portainer-dashboard`, Category: **Integration**.
 3. Find **Portainer Maintenance** in HACS → Integrations → **+ Explore & Download Repositories**, install it.
 4. **Restart Home Assistant** — new `custom_components` are only loaded at startup.
 5. Settings → Devices & Services → **Add Integration** → search "Portainer Maintenance" → enter your webapp's URL and pick the mobile_app device(s) that should get the "update performed" confirmation push.

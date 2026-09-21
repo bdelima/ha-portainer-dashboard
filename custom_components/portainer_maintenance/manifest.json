@@ -1,9 +1,9 @@
 {
     "domain": "portainer_maintenance",
     "name": "Portainer Maintenance",
-    "version": "1.0.10",
-    "documentation": "https://github.com/bdelima/ha-portainer-maintenance",
-    "issue_tracker": "https://github.com/bdelima/ha-portainer-maintenance/issues",
+    "version": "1.0.11",
+    "documentation": "https://github.com/bdelima/ha-portainer-dashboard",
+    "issue_tracker": "https://github.com/bdelima/ha-portainer-dashboard/issues",
     "dependencies": ["portainer"],
     "codeowners": ["@bdelima"],
     "iot_class": "local_polling",
