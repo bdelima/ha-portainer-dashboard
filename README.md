@@ -8,7 +8,7 @@ On setup, this integration:
 - Registers `portainer_maintenance.prune_images` — reclaims disk space by pruning Docker images across every Portainer endpoint this HA instance knows about, discovered automatically from the device registry (no static host list to maintain).
 - Installs its own bundled automation and script blueprints into your Home Assistant config automatically — no manual file copying.
 - Registers a sidebar panel (iframe) pointing at your own Portainer-actions webapp, at a fixed path — no dashboard-title guesswork.
-- Computes the notification click-through URL automatically from your Home Assistant instance's own configured external/internal URL.
+- Computes the notification click-through URL automatically from the webapp URL you enter during setup — no Home Assistant network configuration (Settings → System → Network) required.
 - Exposes three native tracking sensors — `sensor.portainer_updates_pending`, `sensor.portainer_container_trouble`, and `sensor.portainer_stale_devices` — replacing what used to be hand-maintained YAML template sensors.
 
 ## Requirements

@@ -212,16 +212,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     webapp_url = entry.data[CONF_WEBAPP_URL]
 
-    base_url = hass.config.external_url or hass.config.internal_url or ""
-    if base_url:
-        actions_url = f"{base_url.rstrip('/')}/{PANEL_PATH}"
-    else:
-        actions_url = ""
-        _LOGGER.warning(
-            "No external_url or internal_url configured in Home Assistant "
-            "(Settings -> System -> Network) -- the Portainer actions URL "
-            "sensor will be empty until one is set."
-        )
+    # The notification click-through URL just points directly at the
+    # webapp itself, rather than routing through Home Assistant's own
+    # frontend at <ha_url>/PANEL_PATH. The webapp is fully self-contained
+    # (its own server-side HA token, no HA login needed to use it) so it
+    # was never actually necessary to open it through HA's UI. This used
+    # to derive a URL from hass.config.external_url/internal_url
+    # (Settings -> System -> Network) instead, but not everyone has that
+    # configured -- and some setups deliberately leave it alone to avoid
+    # changing how HA itself gets reached from different networks -- so
+    # that left the sensor silently empty and every notification's tap
+    # action a no-op. Using webapp_url directly needs no HA network
+    # config at all.
+    actions_url = webapp_url
     hass.data[DOMAIN][entry.entry_id]["actions_url"] = actions_url
 
     _register_panel(hass, webapp_url)
