@@ -14,7 +14,7 @@ On setup, this integration:
 ## Requirements
 
 - Home Assistant with the core `portainer` integration already configured against at least one Portainer endpoint.
-- The [Portainer Action Dashboard](https://github.com/bdelima/portainer-action-dashboard) webapp, running as its own Docker container and reachable from Home Assistant — this integration only points a sidebar panel at its URL, it doesn't build, run, or provide that container itself. No prebuilt image is published yet, so build it yourself from that repo (`docker build .` or `docker compose build`, see its README for both) until one is.
+- The [Portainer Action Dashboard](https://github.com/bdelima/portainer-action-dashboard) webapp, running as its own Docker container and reachable from Home Assistant — this integration only points a sidebar panel at its URL, it doesn't build, run, or provide that container itself. A prebuilt multi-arch image is published to Docker Hub as [`bdelima/portainer-action-dashboard`](https://hub.docker.com/r/bdelima/portainer-action-dashboard) (`docker pull bdelima/portainer-action-dashboard:latest`); see that repo's README for Compose and `docker run` examples, or to build it from source instead.
 
 ## Installation via HACS
 
