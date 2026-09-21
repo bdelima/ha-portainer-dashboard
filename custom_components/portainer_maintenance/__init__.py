@@ -39,11 +39,13 @@ past "expose one service" into a real maintenance layer on top of the core
    "Add Dashboard -> Webpage -> read the random URL from the address bar"
    step entirely.
 
-4. Computes the notification click-through URL automatically from the
-   webapp URL entered during setup, and exposes it as a read-only sensor
-   (see sensor.py) -- no more typing a URL into a text helper or a
-   config field, and no dependency on HA's own external/internal URL
-   (Settings -> System -> Network) being configured.
+4. Computes the notification click-through URL automatically and exposes
+   it as a read-only sensor (see sensor.py) -- no typing a URL into a
+   text helper or config field. It's a bare relative path (/PANEL_PATH),
+   which the HA companion app treats as "navigate within the server I'm
+   already connected to" -- so tapping a notification always opens the
+   sidebar panel in-app, with no dependency on HA's own external/internal
+   URL (Settings -> System -> Network) being configured at all.
 
 5. Forwards to the sensor platform, which defines the three tracking
    sensors (updates pending / container trouble / stale devices) as native
@@ -343,19 +345,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     webapp_url = entry.data[CONF_WEBAPP_URL]
 
-    # The notification click-through URL just points directly at the
-    # webapp itself, rather than routing through Home Assistant's own
-    # frontend at <ha_url>/PANEL_PATH. The webapp is fully self-contained
-    # (its own server-side HA token, no HA login needed to use it) so it
-    # was never actually necessary to open it through HA's UI. This used
-    # to derive a URL from hass.config.external_url/internal_url
-    # (Settings -> System -> Network) instead, but not everyone has that
-    # configured -- and some setups deliberately leave it alone to avoid
-    # changing how HA itself gets reached from different networks -- so
-    # that left the sensor silently empty and every notification's tap
-    # action a no-op. Using webapp_url directly needs no HA network
-    # config at all.
-    actions_url = webapp_url
+    # The notification click-through URL is a bare RELATIVE path
+    # (/PANEL_PATH), not a full URL. The HA companion app treats a
+    # relative path as "navigate within the server I'm already connected
+    # to" -- so it always opens the sidebar panel in-app, with zero
+    # dependency on hass.config.external_url/internal_url (Settings ->
+    # System -> Network) and no need to know this instance's own address
+    # at all. Earlier versions tried to build an absolute URL from either
+    # HA's own configured network URL or the webapp's own URL -- both
+    # unnecessary detours around a feature the companion app already
+    # provides for exactly this case, and the second one is why tapping a
+    # notification opened an external browser instead of the app.
+    actions_url = f"/{PANEL_PATH}"
     hass.data[DOMAIN][entry.entry_id]["actions_url"] = actions_url
 
     _register_panel(hass, webapp_url)

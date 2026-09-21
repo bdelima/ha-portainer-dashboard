@@ -208,3 +208,33 @@ action:
                       tag: "portainer_stale_devices"
                       clickAction: "{{ states('sensor.portainer_actions_url') }}"
                       url: "{{ states('sensor.portainer_actions_url') }}"
+
+  # 8. Sidebar notification-bell badge: HA's own persistent_notification
+  # count (the bell icon, top of the sidebar) is native and needs no
+  # third-party plugin, unlike a badge on the panel item itself, which
+  # HA's frontend doesn't expose to custom integrations at all. Recomputed
+  # after every run regardless of which trigger fired -- cheap (three
+  # state reads, one service call) and keeps this always correct off the
+  # sensors' current values rather than needing to track deltas per
+  # branch above.
+  - variables:
+      total_action_items: >-
+        {{ (states('sensor.portainer_updates_pending') | int(0))
+           + (states('sensor.portainer_container_trouble') | int(0))
+           + (states('sensor.portainer_stale_devices') | int(0)) }}
+  - if:
+      - condition: template
+        value_template: "{{ total_action_items > 0 }}"
+    then:
+      - action: persistent_notification.create
+        data:
+          notification_id: portainer_maintenance_action_items
+          title: "Portainer Maintenance"
+          message: >-
+            {{ states('sensor.portainer_updates_pending') }} update{{ 's' if states('sensor.portainer_updates_pending') | int(0) != 1 else '' }},
+            {{ states('sensor.portainer_container_trouble') }} container{{ 's' if states('sensor.portainer_container_trouble') | int(0) != 1 else '' }} in trouble,
+            {{ states('sensor.portainer_stale_devices') }} stale device{{ 's' if states('sensor.portainer_stale_devices') | int(0) != 1 else '' }} -- open Portainer Maintenance to review.
+    else:
+      - action: persistent_notification.dismiss
+        data:
+          notification_id: portainer_maintenance_action_items

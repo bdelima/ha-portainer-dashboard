@@ -9,8 +9,9 @@ On setup, this integration:
 - Registers `portainer_maintenance.perform_update` and `portainer_maintenance.update_done` — native services (not user-created scripts) for actually installing an update and posting the "update performed" confirmation, notifying whichever mobile_app device(s) you pick during setup. These used to be separate script blueprints requiring you to manually set each script's Entity ID to match what the automation blueprint called by name — an easy step to get wrong, which HA would then report as a cryptic "automation uses an unknown action" error. A native service has no such step to miss.
 - Installs its own bundled automation blueprint into your Home Assistant config automatically — no manual file copying.
 - Registers a sidebar panel (iframe) pointing at your own Portainer-actions webapp, at a fixed path — no dashboard-title guesswork.
-- Computes the notification click-through URL automatically from the webapp URL you enter during setup — no Home Assistant network configuration (Settings → System → Network) required.
+- Computes the notification click-through URL automatically as a relative path, which the HA companion app opens inside the app itself — no dependency on HA's own external/internal URL (Settings → System → Network) being configured at all.
 - Exposes three native tracking sensors — `sensor.portainer_updates_pending`, `sensor.portainer_container_trouble`, and `sensor.portainer_stale_devices` — replacing what used to be hand-maintained YAML template sensors.
+- Keeps a native HA notification (the bell icon at the top of the sidebar) up to date with a running total across all three sensors whenever anything needs attention, and dismisses it once everything's clear — a real badge/count indicator with no third-party sidebar plugin needed.
 
 ## Requirements
 
