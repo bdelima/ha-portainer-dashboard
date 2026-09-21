@@ -92,7 +92,7 @@ action:
                       - action: "{{ repeat.item }}"
                         data:
                           title: "Update available"
-                          message: "{{ new_item.name }} has a new image ready."
+                          message: "{{ new_item.name }}"
                           data:
                             tag: "{{ new_item.entity }}"
                             actions:
@@ -127,6 +127,25 @@ action:
                     message: "clear_notification"
                     data:
                       tag: "{{ trigger.event.data.action.replace('DISMISS_UPDATE_', '') }}"
+
+      # 4. Handle "Restart Stack Now" -- offered only when perform_update hit
+      #    the confirmed, unfixed Portainer bug where recreating a single
+      #    container on network_mode: service:X/container:X (a VPN sidecar
+      #    like gluetun) fails at the Docker daemon level over a
+      #    hostname/network_mode conflict. The pull+recreate itself still
+      #    completes, but the image tag only reconciles once the owning
+      #    stack is restarted -- see __init__.py's module docstring (1c.)
+      #    for the full story. Deliberately a tap, not automatic: a stack
+      #    restart bounces every other container in it too.
+      - conditions:
+          - condition: trigger
+            id: notification_action
+          - condition: template
+            value_template: "{{ trigger.event.data.action.startswith('RESTART_STACK_') }}"
+        sequence:
+          - action: portainer_maintenance.restart_stack
+            data:
+              switch_entity_id: "{{ trigger.event.data.action.replace('RESTART_STACK_', '') }}"
 
       # 5. Startup recheck for missed updates
       - conditions:

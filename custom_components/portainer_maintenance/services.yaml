@@ -53,3 +53,78 @@ prune_images:
           min: 1
           max: 8760
           mode: box
+
+perform_update:
+  name: Perform update
+  description: >-
+    Recreates/pulls the container behind a pending update.* entity via the
+    core portainer.recreate_container action, then either posts an
+    "update complete" confirmation (matching update_done below) or, if the
+    recreate itself fails the way Portainer does for containers sharing
+    another container's network (network_mode: service:<other>/container:<other>
+    -- a confirmed, unfixed Portainer/Docker daemon conflict, not a bug in
+    this integration: see github.com/orgs/portainer/discussions/12389),
+    swallows that error and notifies that the owning stack needs a manual
+    restart to finish cleanly instead. Called by the bundled automation
+    blueprint's "Update now" notification action and by the companion
+    ha-portainer-sidecar webapp; safe to call directly from a script or
+    Developer Tools too. Returns {needs_stack_restart, stack_switch_entity_id}
+    via HA's action-response-data feature (call with "Response variable"
+    set, or `?return_response` over the REST API) so a caller can react to
+    the stack-restart case immediately instead of only via the phone push.
+  fields:
+    update_entity:
+      name: Update entity
+      description: The update.* entity to recreate the container for.
+      required: true
+      example: update.dozzle_agent_image_update
+      selector:
+        entity:
+          domain: update
+
+update_done:
+  name: Update done
+  description: >-
+    Posts the same "update complete" confirmation perform_update sends on
+    success, without doing any recreate itself. For a caller that already
+    performed the update through some other path (e.g. Portainer's own UI)
+    and just wants this integration's tracking/notification state to
+    reflect it. Most setups never need to call this directly -- it's what
+    perform_update calls internally on a successful recreate.
+  fields:
+    device_name:
+      name: Device name
+      description: The friendly container/device name to show in the confirmation.
+      required: true
+      example: dozzle-agent
+      selector:
+        text:
+    update_entity:
+      name: Update entity
+      description: The update.* entity that was updated.
+      required: true
+      example: update.dozzle_agent_image_update
+      selector:
+        entity:
+          domain: update
+
+restart_stack:
+  name: Restart stack
+  description: >-
+    Stops then starts every container in a Portainer stack, via that
+    stack's own switch.* entity (a stop, a settle pause, then a start --
+    not the core switch's toggle, since Docker needs a moment between the
+    two). Bounces every container in the stack, not just the one that
+    needed it, so this isn't run automatically after every update --
+    only offered when perform_update detects the network_mode:service
+    daemon conflict described above. Safe to call anytime you want a full
+    stack recycle, not just after that prompt.
+  fields:
+    switch_entity_id:
+      name: Stack switch
+      description: The switch.* entity for the Portainer stack to restart.
+      required: true
+      example: switch.media_stack
+      selector:
+        entity:
+          domain: switch

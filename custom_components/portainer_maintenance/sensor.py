@@ -88,6 +88,48 @@ def _device_name(device_reg: dr.DeviceRegistry, device_id: str | None) -> str | 
     return device.name_by_user or device.name
 
 
+def _stack_info(
+    device_reg: dr.DeviceRegistry, entity_reg: er.EntityRegistry, container_device_id: str | None
+) -> tuple[str | None, str | None]:
+    """(stack_name, stack_switch_entity_id) for a container device, or
+    (None, None) if it isn't part of a stack.
+
+    The device hierarchy is Endpoint -> Stack -> Container (confirmed via
+    HA's own device list, not assumed): a container's immediate parent
+    (via_device_id) is its stack. But a *standalone* container (deployed
+    outside Compose) is parented directly to the Endpoint instead, with no
+    Stack device in between -- so the immediate parent alone doesn't tell
+    us which case we're in. The distinguishing check: a real Stack device
+    has its own via_device_id pointing further up to the Endpoint, while
+    the Endpoint itself has none (same root-detection trick used
+    elsewhere in this file). If the immediate parent has no further
+    parent, it IS the Endpoint, and this container has no stack.
+
+    Used both by the updates-pending sensor (to group the dashboard's
+    tree view) and by __init__.py's perform_update (to find the switch.*
+    entity to offer restarting when a recreate hits the known
+    network_mode:service:X daemon-conflict bug)."""
+    if container_device_id is None:
+        return None, None
+    container_device = device_reg.async_get(container_device_id)
+    if container_device is None or container_device.via_device_id is None:
+        return None, None
+
+    parent = device_reg.async_get(container_device.via_device_id)
+    if parent is None or parent.via_device_id is None:
+        # Parent has no parent of its own -> parent IS the root Endpoint,
+        # so this container is standalone, not part of a stack.
+        return None, None
+
+    stack_name = parent.name_by_user or parent.name
+    switch_entity_id = None
+    for entity in er.async_entries_for_device(entity_reg, container_device.via_device_id):
+        if entity.entity_id.startswith("switch."):
+            switch_entity_id = entity.entity_id
+            break
+    return stack_name, switch_entity_id
+
+
 # ---------------------------------------------------------------------------
 # Coordinators -- one per sensor, matching the original recompute cadence.
 # ---------------------------------------------------------------------------
@@ -115,12 +157,18 @@ class PortainerUpdatesCoordinator(DataUpdateCoordinator[list[dict]]):
             root_id = _walk_to_root(device_reg, device_id)
             host = _device_name(device_reg, root_id) or "unknown host"
             friendly_name = state.attributes.get("friendly_name", entity_id)
+            stack_name, stack_switch_entity_id = _stack_info(device_reg, entity_reg, device_id)
 
             found.append(
                 {
                     "entity": entity_id,
                     "name": f"{friendly_name} ({host})",
                     "secondary_info": "Update available",
+                    # None/None for a standalone container not part of a
+                    # stack -- the dashboard's tree view groups those under
+                    # a flat "Standalone" bucket instead of a named stack.
+                    "stack_name": stack_name,
+                    "stack_switch_entity_id": stack_switch_entity_id,
                 }
             )
 

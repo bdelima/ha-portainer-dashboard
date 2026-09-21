@@ -64,6 +64,33 @@ class PortainerMaintenanceConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         if user_input is not None:
             await self.async_set_unique_id(DOMAIN)
             self._abort_if_unique_id_configured()
+
+            # There's no supported way for a config flow to hand the browser
+            # off to a different page on completion (checked: no query param
+            # on the automation editor, and the my.home-assistant.io
+            # blueprint_import redirect is for importing a blueprint from a
+            # URL, not creating an automation from one already installed
+            # locally, which is what we do). A one-time persistent
+            # notification with a direct link is the closest available
+            # nudge -- one tap to the right list instead of hunting through
+            # Settings, even though picking "Use Blueprint" and finding ours
+            # by name is still manual after that.
+            await self.hass.services.async_call(
+                "persistent_notification",
+                "create",
+                {
+                    "notification_id": "portainer_maintenance_setup_next_step",
+                    "title": "Portainer Maintenance: one more step",
+                    "message": (
+                        "Setup is complete. To get update/trouble/stale-device "
+                        "notifications, create an automation from the bundled "
+                        "blueprint: [Automations](/config/automations/dashboard) "
+                        "→ **Add Automation** → **Use Blueprint** → "
+                        '"Portainer Maintenance".'
+                    ),
+                },
+            )
+
             return self.async_create_entry(title="Portainer Maintenance", data=user_input)
 
         return self.async_show_form(step_id="user", data_schema=_schema())
