@@ -162,6 +162,7 @@ action:
                     data:
                       tag: "portainer_updates_pending"
                       clickAction: "{{ states('sensor.portainer_actions_url') }}"
+                      url: "{{ states('sensor.portainer_actions_url') }}"
 
       # 6. Notify on container trouble
       - conditions:
@@ -185,6 +186,7 @@ action:
                       ttl: 0
                       channel: alarm_stream
                       clickAction: "{{ states('sensor.portainer_actions_url') }}"
+                      url: "{{ states('sensor.portainer_actions_url') }}"
 
       # 7. Report stale Portainer devices
       - conditions:
@@ -205,3 +207,4 @@ action:
                     data:
                       tag: "portainer_stale_devices"
                       clickAction: "{{ states('sensor.portainer_actions_url') }}"
+                      url: "{{ states('sensor.portainer_actions_url') }}"

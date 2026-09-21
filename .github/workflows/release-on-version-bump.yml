@@ -1,0 +1,51 @@
+name: Release on version bump
+
+# HACS shows a raw commit SHA instead of a real version number until this
+# repo has actual GitHub Releases whose tags match manifest.json's
+# `version`. This workflow makes that fully automatic and matches the rest
+# of this project's "no manual step, ever" approach: bump manifest.json's
+# version and push to main, and a matching tag + release appear on their
+# own -- nothing to remember to do by hand, and no CI step required beyond
+# the push itself.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - custom_components/portainer_maintenance/manifest.json
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Read version from manifest.json
+        id: version
+        run: |
+          VERSION=$(jq -r .version custom_components/portainer_maintenance/manifest.json)
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Skip if this version was already released
+        id: check
+        run: |
+          if git rev-parse "${{ steps.version.outputs.version }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create tag and GitHub Release
+        if: steps.check.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.version.outputs.version }}" \
+            --title "${{ steps.version.outputs.version }}" \
+            --generate-notes

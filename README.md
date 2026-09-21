@@ -5,6 +5,7 @@ A Home Assistant custom integration that turns the core [`portainer`](https://ww
 On setup, this integration:
 
 - Registers `portainer_maintenance.remove_device` — a real service for deleting stale Portainer devices/stacks that HA's own UI can't delete via any documented service (built on the stable `device_registry.async_remove_device()` API).
+- Registers `portainer_maintenance.prune_images` — reclaims disk space by pruning Docker images across every Portainer endpoint this HA instance knows about, discovered automatically from the device registry (no static host list to maintain).
 - Installs its own bundled automation and script blueprints into your Home Assistant config automatically — no manual file copying.
 - Registers a sidebar panel (iframe) pointing at your own Portainer-actions webapp, at a fixed path — no dashboard-title guesswork.
 - Computes the notification click-through URL automatically from your Home Assistant instance's own configured external/internal URL.
@@ -13,7 +14,7 @@ On setup, this integration:
 ## Requirements
 
 - Home Assistant with the core `portainer` integration already configured against at least one Portainer endpoint.
-- A reachable webapp URL for the sidebar panel to point at (see the design doc's "Webpage dashboard" section) — this integration doesn't provide that webapp itself.
+- The [Portainer Action Dashboard](https://github.com/bdelima/portainer-action-dashboard) webapp, running as its own Docker container and reachable from Home Assistant — this integration only points a sidebar panel at its URL, it doesn't build, run, or provide that container itself. No prebuilt image is published yet, so build it yourself from that repo (`docker build .` or `docker compose build`, see its README for both) until one is.
 
 ## Installation via HACS
 
@@ -28,14 +29,6 @@ On setup, this integration:
 ## Manual installation (without HACS)
 
 Copy `custom_components/portainer_maintenance/` into your Home Assistant config's `custom_components/` directory, then follow steps 4–7 above.
-
-## Migrating from an older "Portainer Cleanup" setup
-
-If you previously ran a separate `portainer_cleanup` integration, a hand-maintained `templates.yaml`, and/or standalone blueprint files:
-
-- Remove the old `portainer_cleanup` integration (Settings → Devices & Services) — different domain, so it won't conflict, but no reason to keep it.
-- Remove `templates.yaml`'s `template: !include` line from `configuration.yaml` and delete `templates.yaml` **before restarting** — otherwise the new native sensors will collide with the old template-based ones and land on `_2`-suffixed entity IDs instead of the real ones.
-- The old standalone blueprint files can be left in place or removed; they simply aren't the ones used anymore (this integration installs its own copies under `blueprints/*/portainer_maintenance/`).
 
 ## License
 

@@ -1,7 +1,7 @@
 {
     "domain": "portainer_maintenance",
     "name": "Portainer Maintenance",
-    "version": "1.0.3",
+    "version": "1.0.5",
     "documentation": "https://github.com/bdelima/ha-portainer-maintenance",
     "issue_tracker": "https://github.com/bdelima/ha-portainer-maintenance/issues",
     "dependencies": ["portainer"],
