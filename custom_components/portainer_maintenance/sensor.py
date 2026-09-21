@@ -25,7 +25,7 @@ auto-suffix these as _2 to avoid colliding with the old ones.
 from __future__ import annotations
 
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import homeassistant.util.dt as dt_util
 from homeassistant.components.sensor import SensorEntity
@@ -134,23 +134,65 @@ def _stack_info(
 # Coordinators -- one per sensor, matching the original recompute cadence.
 # ---------------------------------------------------------------------------
 
+# Confirmed, unfixed, unmerged HA core bug (home-assistant/core#182584): a
+# portainer update.* entity's own internal watcher cache is keyed to the
+# container's OLD id, so after perform_update actually recreates it, this
+# entity's state can keep reporting "on" (update available) for as long as
+# 24h -- its own next full rescan -- even though the update genuinely
+# completed. We can't fix that cache from here; instead, once
+# perform_update tells us a given update_entity's recreate went through
+# (see __init__.py), we hide that entity from this list ourselves for a
+# while, rather than showing the user a "pending update" we already know
+# is stale. 6 hours comfortably covers the common case (the core bug can
+# persist up to 24h, but a second *real* update landing for the same
+# container within 6h of the last one is effectively never going to
+# happen in practice) -- bump this if it turns out not to be enough.
+RECENTLY_CONFIRMED_GRACE = timedelta(hours=6)
+
+
 class PortainerUpdatesCoordinator(DataUpdateCoordinator[list[dict]]):
     """Ports the original 5-minute update_items template."""
 
     def __init__(self, hass: HomeAssistant) -> None:
         super().__init__(hass, _LOGGER, name=SENSOR_UPDATES_PENDING, update_interval=timedelta(minutes=5))
+        self._recently_confirmed: dict[str, datetime] = {}
+
+    def mark_recently_updated(self, update_entity: str) -> None:
+        """Called by __init__.py's perform_update once a recreate for this
+        entity has actually gone through (with or without hitting the
+        network_mode:service:X daemon-conflict case) -- see
+        RECENTLY_CONFIRMED_GRACE above for why this exists."""
+        self._recently_confirmed[update_entity] = dt_util.utcnow()
 
     async def _async_update_data(self) -> list[dict]:
         entity_reg = er.async_get(self.hass)
         device_reg = dr.async_get(self.hass)
         found: list[dict] = []
+        now = dt_util.utcnow()
 
         for entity_id in _portainer_entity_ids(entity_reg):
             if not entity_id.startswith("update."):
                 continue
             state = self.hass.states.get(entity_id)
             if state is None or state.state != "on":
+                # The core bug this coordinator works around only ever
+                # over-reports "on" -- it never wrongly clears itself, so
+                # a state we can see is "off"/unavailable is trustworthy
+                # on its own. Drop any suppression for it immediately
+                # rather than waiting out the grace window, so a genuine
+                # subsequent update is never masked by a stale entry.
+                self._recently_confirmed.pop(entity_id, None)
                 continue
+
+            confirmed_at = self._recently_confirmed.get(entity_id)
+            if confirmed_at is not None:
+                if now - confirmed_at < RECENTLY_CONFIRMED_GRACE:
+                    continue
+                # Grace window elapsed and core still reports "on" -- the
+                # 24h cache is the likely explanation, but we've done what
+                # we reasonably can; let it reappear rather than hide it
+                # forever on the strength of one confirmation.
+                del self._recently_confirmed[entity_id]
 
             reg_entry = entity_reg.async_get(entity_id)
             device_id = reg_entry.device_id if reg_entry else None

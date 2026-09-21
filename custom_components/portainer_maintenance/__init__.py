@@ -461,6 +461,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             )
             needs_stack_restart = True
 
+        # The recreate actually went through at this point (either cleanly,
+        # or via the swallowed known-conflict case above) -- but the core
+        # portainer integration's own update.* entity can keep reporting
+        # "update available" for hours regardless (home-assistant/core#182584,
+        # an open/unmerged upstream bug: its watcher cache is keyed to the
+        # container's old id). Tell our own updates-pending coordinator we
+        # just confirmed this one, so the dashboard/sidebar sensor stops
+        # showing it as pending immediately instead of waiting on a core fix
+        # that hasn't landed -- see RECENTLY_CONFIRMED_GRACE in sensor.py.
+        updates_coordinator = (
+            hass.data.get(DOMAIN, {}).get(entry.entry_id, {}).get("coordinators", {}).get("updates")
+        )
+        if updates_coordinator is not None:
+            updates_coordinator.mark_recently_updated(update_entity)
+            await updates_coordinator.async_request_refresh()
+
         for service in _notify_services_for_entry(hass, entry):
             domain, service_name = service.split(".", 1)
             await hass.services.async_call(
