@@ -143,11 +143,13 @@ def _stack_info(
 # perform_update tells us a given update_entity's recreate went through
 # (see __init__.py), we hide that entity from this list ourselves for a
 # while, rather than showing the user a "pending update" we already know
-# is stale. 6 hours comfortably covers the common case (the core bug can
-# persist up to 24h, but a second *real* update landing for the same
-# container within 6h of the last one is effectively never going to
-# happen in practice) -- bump this if it turns out not to be enough.
-RECENTLY_CONFIRMED_GRACE = timedelta(hours=6)
+# is stale. Set past the full 24h the core bug can persist, rather than
+# stopping short of it -- a suppression that expires early just means the
+# blueprint treats the stale "on" reappearing as a *newly appeared* update
+# and sends a fresh push about it, which is worse than the original
+# problem. A second *real* update landing for the same container within
+# 25h of the last one is effectively never going to happen in practice.
+RECENTLY_CONFIRMED_GRACE = timedelta(hours=25)
 
 
 class PortainerUpdatesCoordinator(DataUpdateCoordinator[list[dict]]):
@@ -174,14 +176,22 @@ class PortainerUpdatesCoordinator(DataUpdateCoordinator[list[dict]]):
             if not entity_id.startswith("update."):
                 continue
             state = self.hass.states.get(entity_id)
-            if state is None or state.state != "on":
-                # The core bug this coordinator works around only ever
-                # over-reports "on" -- it never wrongly clears itself, so
-                # a state we can see is "off"/unavailable is trustworthy
-                # on its own. Drop any suppression for it immediately
-                # rather than waiting out the grace window, so a genuine
-                # subsequent update is never masked by a stale entry.
+            if state is None or state.state == "off":
+                # Gone, or genuinely confirmed no-update-pending -- either
+                # way trustworthy on its own, so drop any suppression for
+                # it immediately rather than waiting out the grace window,
+                # so a real subsequent update is never masked by a stale
+                # entry.
                 self._recently_confirmed.pop(entity_id, None)
+                continue
+            if state.state != "on":
+                # Something else -- most likely "unavailable", which the
+                # entity can go through transiently while its container is
+                # mid-recreate, or during an unrelated core-integration
+                # polling hiccup. That's not a trustworthy "no update"
+                # signal the way "off" is, so leave any existing
+                # suppression alone rather than let a flicker resurface
+                # the known-stale "on" the moment it comes back.
                 continue
 
             confirmed_at = self._recently_confirmed.get(entity_id)
