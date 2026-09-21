@@ -249,11 +249,16 @@ action:
         data:
           notification_id: portainer_maintenance_action_items
           title: "Portainer Maintenance"
-          message: >-
-            {{ states('sensor.portainer_updates_pending') }} update{{ 's' if states('sensor.portainer_updates_pending') | int(0) != 1 else '' }},
-            {{ states('sensor.portainer_container_trouble') }} container{{ 's' if states('sensor.portainer_container_trouble') | int(0) != 1 else '' }} in trouble,
-            {{ states('sensor.portainer_stale_devices') }} stale device{{ 's' if states('sensor.portainer_stale_devices') | int(0) != 1 else '' }}.
-            [Open dashboard](/portainer-actions) to review.
+          message: |-
+            {%- set updates_n = states('sensor.portainer_updates_pending') | int(0) -%}
+            {%- set stale_n = states('sensor.portainer_stale_devices') | int(0) -%}
+            {%- set trouble_n = states('sensor.portainer_container_trouble') | int(0) -%}
+            {%- set parts = [] -%}
+            {%- if updates_n > 0 -%}{%- set parts = parts + [updates_n ~ ' image update' ~ ('s' if updates_n != 1 else '')] -%}{%- endif -%}
+            {%- if stale_n > 0 -%}{%- set parts = parts + [stale_n ~ ' stale device' ~ ('s' if stale_n != 1 else '')] -%}{%- endif -%}
+            {%- if trouble_n > 0 -%}{%- set parts = parts + [trouble_n ~ ' container' ~ ('s' if trouble_n != 1 else '') ~ ' in trouble'] -%}{%- endif -%}
+            {%- set summary = parts[0] if parts | length == 1 else (parts[0] ~ ' and ' ~ parts[1]) if parts | length == 2 else (parts[:-1] | join(', ') ~ ', and ' ~ parts[-1]) -%}
+            Portainer is reporting {{ summary }}. [Open dashboard](/portainer-actions) to review.
     else:
       - action: persistent_notification.dismiss
         data:
