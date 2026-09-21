@@ -252,7 +252,8 @@ action:
           message: >-
             {{ states('sensor.portainer_updates_pending') }} update{{ 's' if states('sensor.portainer_updates_pending') | int(0) != 1 else '' }},
             {{ states('sensor.portainer_container_trouble') }} container{{ 's' if states('sensor.portainer_container_trouble') | int(0) != 1 else '' }} in trouble,
-            {{ states('sensor.portainer_stale_devices') }} stale device{{ 's' if states('sensor.portainer_stale_devices') | int(0) != 1 else '' }} -- open Portainer Maintenance to review.
+            {{ states('sensor.portainer_stale_devices') }} stale device{{ 's' if states('sensor.portainer_stale_devices') | int(0) != 1 else '' }}.
+            [Open dashboard](/portainer-actions) to review.
     else:
       - action: persistent_notification.dismiss
         data:
