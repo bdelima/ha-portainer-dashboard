@@ -11,13 +11,13 @@ A notification-driven system for managing container image updates and health acr
 - Stay dynamic — new containers should be picked up automatically without editing automations
 - Handle the reality that some containers can't be safely recreated in isolation (see [Stack-restart-needed flow](#stack-restart-needed-flow-networkmodeservice-containers))
 
-**A note on history:** this system has been through three distinct eras. A Lovelace-dashboard phase (auto-entities cards, double-tap multi-select via `input_text` helpers) came first and is fully superseded — see [portainer-ha-container-management-legacy.md](portainer-ha-container-management-legacy.md), nothing here depends on it. Next came a single-host, SSH-deploy-block era: a hand-maintained `templates.yaml`, standalone blueprints, and a webapp built with paste-and-run deploy scripts, everything living under `/opt/homeassistant/...` on ojochal with no version history beyond git commits to a private `homeassistant-config` repo. **This document now describes the current, third era**, current as of the integration's `1.1.4` release and the webapp's `1.1.1` release: both pieces are real, independently versioned, publicly-hosted projects with their own release history, replacing the deploy-block model entirely.
+**A note on history:** this system has been through three distinct eras. A Lovelace-dashboard phase (auto-entities cards, double-tap multi-select via `input_text` helpers) came first and is fully superseded — see [portainer-ha-container-management-legacy.md](portainer-ha-container-management-legacy.md), nothing here depends on it. Next came a single-host, SSH-deploy-block era: a hand-maintained `templates.yaml`, standalone blueprints, and a webapp built with paste-and-run deploy scripts, everything living under `/opt/homeassistant/...` on ojochal with no version history beyond git commits to a private `homeassistant-config` repo. **This document now describes the current, third era**, current as of the integration's `1.2.0` release and the webapp's `1.2.0` release: both pieces are real, independently versioned, publicly-hosted projects with their own release history, replacing the deploy-block model entirely.
 
 ## Where the code actually lives
 
 This document is deliberately not a mirror of the source — an earlier version of it reproduced entire files inline and quietly went stale as the real repos moved on without it (script-based `service.portainer_perform_update`, a `homeassistant-config` repo that no longer matches reality, a `manifest.json` version three major bumps behind). To avoid repeating that, this document covers **architecture, rationale, and current behavior** and defers to the repos themselves for anything that changes with every release:
 
-- **[bdelima/ha-portainer-dashboard](https://github.com/bdelima/ha-portainer-dashboard)** — the HA custom integration (`custom_components/portainer_maintenance/`). HACS-installable (or manual copy), Python 1.1.x, GitHub Releases + an automatic `release-on-version-bump` workflow.
+- **[bdelima/ha-portainer-dashboard](https://github.com/bdelima/ha-portainer-dashboard)** — the HA custom integration (`custom_components/portainer_maintenance/`). HACS-installable (or manual copy), Python 1.2.x, GitHub Releases + an automatic `release-on-version-bump` workflow.
 - **[bdelima/ha-portainer-sidecar](https://github.com/bdelima/ha-portainer-sidecar)** — the standalone webapp. Published as a multi-arch Docker image on [Docker Hub](https://hub.docker.com/r/bdelima/ha-portainer-sidecar), built and released automatically on every `VERSION` bump.
 
 Both repos were renamed to their current names from `ha-portainer-maintenance` and `portainer-action-dashboard` respectively (a `gh repo rename`, which preserves history/issues/secrets and leaves a GitHub redirect from the old name). The integration's internal domain deliberately stayed `portainer_maintenance` — that's the "Portainer Maintenance" friendly name users actually see, so the domain still matches it even though the repo's own name changed.
@@ -30,7 +30,7 @@ Everything that used to be a hand-run SSH deploy block is now either a HACS/git 
 2. **Install the integration.** Either via HACS (add `bdelima/ha-portainer-dashboard` as a custom repository) or by copying `custom_components/portainer_maintenance/` into HA's config dir by hand. **Restart HA** (a real restart — `custom_components` code only loads at startup), then Settings → Devices & Services → **Add Integration** → "Portainer Maintenance" → enter the webapp's own URL, and pick the mobile_app device(s) that should get pushes. This one step installs the bundled blueprint, registers the sidebar panel, computes the notification click-through URL, and creates the tracking sensors. A one-time `persistent_notification` appears right after setup finishes, linking straight to the automations dashboard so the next step isn't a hunt through Settings.
 3. Settings → Automations & Scenes → Create Automation → **Use Blueprint** → "Portainer Maintenance: automations (merged)" → nothing else to configure; it reads its notify target from the config entry, not a blueprint input (see [why](#automations) below).
 
-No per-new-container manual step remains: hiding a new container's `update.*` entity — previously a "remember to do this every time" chore — is now handled automatically (see `hide_update_entities` below, staged for the next release).
+No per-new-container manual step remains: hiding a new container's `update.*` entity — previously a "remember to do this every time" chore — is now handled automatically (see `hide_update_entities` below, shipped in 1.2.0).
 
 An existing install picks up a `notify_devices` field it didn't originally have via Settings → Devices & Services → Portainer Maintenance → **Reconfigure**, without deleting and re-adding the integration.
 
@@ -94,7 +94,7 @@ On every load, it:
 | `portainer_maintenance.perform_update` | The real entry point for installing an update — see below and [Stack-restart-needed flow](#stack-restart-needed-flow-networkmodeservice-containers). Returns `{needs_stack_restart, stack_switch_entity_id}` via HA's action-response-data feature (`supports_response=OPTIONAL`), so a caller that isn't just a phone tapping a push notification — the webapp — can react synchronously instead of only through the async push. |
 | `portainer_maintenance.update_done` | Shared "update complete" notification logic, exposed as its own callable service for anything that performs an update through some other path and just wants this system's tracking/notification state to reflect it. |
 | `portainer_maintenance.restart_stack` | Stop → 5s settle → start of a whole stack via its `switch.*` entity. Deliberately never called automatically — see below. |
-| `portainer_maintenance.hide_update_entities` | Scans every Portainer `update.*` entity and hides any not already hidden (staged for the next release — not yet in a tagged version). Closes the "hide its `update.*` entity" manual per-new-container step; see [Automations](#automations) branches 5 and 8 for when it's called. Re-hides an entity a user manually un-hid, by design — this system's whole point is that these entities' state belongs on the dashboard, not HA's own entity list. |
+| `portainer_maintenance.hide_update_entities` | Scans every Portainer `update.*` entity and hides any not already hidden (1.2.0). Closes the "hide its `update.*` entity" manual per-new-container step; see [Automations](#automations) branches 5 and 8 for when it's called. Re-hides an entity a user manually un-hid, by design — this system's whole point is that these entities' state belongs on the dashboard, not HA's own entity list. |
 
 `perform_update`/`update_done` used to be blueprint *scripts*, each requiring the user to create a script instance from the blueprint and then manually override its auto-generated Entity ID to the exact literal string the automation blueprint called by name — an easy step to miss, and when missed, HA reported it as an opaque "automation uses an unknown action" repair with no obvious link back to the real cause. Native services have no user-assigned entity_id to get wrong in the first place; both read who to notify from the config entry's `notify_devices` instead of a blueprint input, since a plain service call has no blueprint inputs to read from.
 
@@ -120,7 +120,7 @@ The current branches:
 5. **Container trouble** — high-priority push (bypasses silent/DND via `alarm_stream`) when `sensor.portainer_container_trouble`'s count *increases*. Known accepted gap: `restart: unless-stopped` containers that crash-loop rarely spend meaningful time in `exited`, since Docker restarts them almost immediately — the tracking sensor's settle-time check can miss this. No fix implemented (would need a separate `command_line` sensor tracking Docker's `RestartCount`).
 6. **Stale devices** — push when `sensor.portainer_stale_devices`'s count increases. Deletion happens from the webapp's Stale tab (`portainer_maintenance.remove_device`), not from this branch.
 7. **Sidebar-bell restart-stack action** — when a phone push's "Restart Stack Now" action fires, calls `portainer_maintenance.restart_stack` with the entity_id encoded in the action string (`RESTART_STACK_<switch_entity_id>`).
-8. **Hide a newly-registered update entity** *(staged for the next release)* — fires on `entity_registry_updated`, filtered by the same dynamic config-entry-domain scoping used everywhere else in this design, to just a newly-created `update.*` entity under the `portainer` platform. Calls `hide_update_entities` the moment such an entity appears, rather than waiting for the next HA restart. Branch 4 (startup recheck) gained a matching one-time sweep for anything that predates this feature.
+8. **Hide a newly-registered update entity** *(1.2.0)* — fires on `entity_registry_updated`, filtered by the same dynamic config-entry-domain scoping used everywhere else in this design, to just a newly-created `update.*` entity under the `portainer` platform. Calls `hide_update_entities` the moment such an entity appears, rather than waiting for the next HA restart. Branch 4 (startup recheck) gained a matching one-time sweep for anything that predates this feature.
 9. **Sidebar-bell action-items summary** — recomputed after *every* branch above fires, off the three sensors' current values (not deltas), so it's always correct regardless of which branch ran. Builds a natural-language sentence from only the nonzero categories and links straight to the panel:
 
    ```
@@ -164,7 +164,7 @@ This is in-memory only (an attribute on the coordinator instance), so an HA rest
 
 **Status: confirmed working in production.** Tested against a real container update (not synthetic) — the dashboard/sidebar stopped showing the item as pending immediately after the recreate, instead of sitting on the stale `on` state.
 
-## Changelog links *(staged for the next release)*
+## Changelog links *(1.2.0)*
 
 The same core update-entity limitation shows up again here: `installed_version`/`latest_version` are raw digest hashes, and neither `release_summary` nor `release_url` is ever populated — there's no changelog data anywhere in this system to just surface. Three ways to get one anyway were considered:
 
@@ -212,7 +212,7 @@ A long-lived HA access token, read from `HA_TOKEN_FILE` (preferred — keeps it 
 
 ## Operational notes
 
-- **New containers require one manual step:** hide their `update.*` entity to avoid badge clutter — confirmed zero effect on automation triggering.
+- **No manual step for new containers as of 1.2.0:** `hide_update_entities` now hides a new `update.*` entity automatically (confirmed zero effect on automation triggering) — see [Setup steps](#setup-steps). Not yet exercised against a real newly-added container, only against entities that already existed at the time it shipped — see [Verification checklist](#verification-checklist).
 - **Portainer's HA integration auto-assigns Area = stack/host name** to every device it creates. Cosmetic, no automation here uses Area.
 - **Watchtower has been retired** in favor of this review-and-approve flow. Recommend removing the Watchtower stack/container entirely (it held broad Docker socket access) rather than leaving it stopped.
 - **Known accepted limitation — multi-arch manifest-list images:** some images (confirmed case: `ghcr.io/bakito/adguardhome-sync`, all current tags) publish only multi-architecture manifest lists with no clean single-platform tag. Update detection for these can get stuck, likely a digest-comparison mismatch between the manifest-list digest and the platform-specific digest actually running. No fix implemented — Portainer's own UI remains the fallback source of truth for these specific images.
@@ -228,6 +228,8 @@ A long-lived HA access token, read from `HA_TOKEN_FILE` (preferred — keeps it 
 - [ ] Batch-select + confirm flow in the webapp for Updates, Trouble, and Stale together (each has been touched individually; not stress-tested together).
 - [ ] The stale-devices whole-host-down guard (a host outage should not make the Endpoint device itself appear in `sensor.portainer_stale_devices`) — logic fixed and unit-tested standalone, not yet confirmed against a real host outage.
 - [ ] iframe rendering at phone width in the Companion App specifically, post stack-tree UI changes.
+- [ ] `hide_update_entities`'s `entity_registry_updated` branch against a genuinely new container (only run so far against entities that already existed).
+- [ ] Changelog-link auto-discovery against a real ghcr.io image and a real Docker Hub/`lscr.io` image with a pending update — logic unit-tested standalone (repo-path parsing, GitHub-link extraction), not yet confirmed making the actual live HTTP calls against real registries from inside a running HA instance.
 
 ## Version history
 
@@ -239,16 +241,14 @@ A long-lived HA access token, read from `HA_TOKEN_FILE` (preferred — keeps it 
 | 1.1.2 | Sidebar-bell notification: rewritten as a natural sentence, zero-count categories omitted |
 | 1.1.3 | Just-updated suppression (first pass) |
 | 1.1.4 | Just-updated suppression fixes: `unavailable` no longer clears it early, grace window extended to 25h |
+| 1.2.0 | `hide_update_entities` service plus blueprint branches 4/8, closing the "hide its update.* entity" manual setup step. `changelog_url` on the updates-pending sensor's items, backed by the `_KNOWN_CHANGELOG_URLS` override table plus automatic ghcr.io/Docker Hub discovery. Design doc rewrite. **Not yet exercised against real production updates as of this release** — see [Verification checklist](#verification-checklist). |
 
 **Webapp (`ha-portainer-sidecar`):**
 | Version | Highlights |
 |---|---|
 | 1.1.0 | Renamed from `portainer-action-dashboard`; service-name fix |
 | 1.1.1 | Auto-discovery of `HA_BASE_URL`/`HA_PUBLIC_URL`, stack-grouped tree UI, stack-restart-needed banner |
-
-**Staged locally, held back pending more real-world testing before the next release:**
-- Integration: `hide_update_entities` service plus blueprint branches 4/8, closing the "hide its update.* entity" manual setup step. Also: `changelog_url` on the updates-pending sensor's items, backed by the `_KNOWN_CHANGELOG_URLS` override table plus automatic ghcr.io/Docker Hub discovery — see [Changelog links](#changelog-links-staged-for-the-next-release).
-- Webapp: a page-heading tweak, "Container Actions" → "Items Needing Attention." Also: the "Changelog" link next to Install, when `changelog_url` is present.
+| 1.2.0 | Page heading, "Container Actions" → "Items Needing Attention." The "Changelog" link next to Install, when `changelog_url` is present. |
 
 ## Testing methodology used
 
