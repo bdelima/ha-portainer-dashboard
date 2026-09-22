@@ -133,6 +133,37 @@ def _stack_info(
     return stack_name, switch_entity_id
 
 
+def _container_image_entity_id(entity_reg: er.EntityRegistry, container_device_id: str | None) -> str | None:
+    """The sensor.<name>_image entity on a container's own device, if any
+    -- core's portainer integration creates one per container. Shared by
+    the changelog-link lookup below and, in __init__.py, by
+    handle_perform_update's recreate-outcome check -- both need "what
+    image reference is this container on right now," just for different
+    reasons."""
+    if container_device_id is None:
+        return None
+    for entity in er.async_entries_for_device(entity_reg, container_device_id):
+        if entity.entity_id.startswith("sensor.") and entity.entity_id.endswith("_image"):
+            return entity.entity_id
+    return None
+
+
+# A container's image reference degrading to a bare content digest --
+# 'sha256:<64 hex chars>' or just the 64 hex chars alone, no repo path, no
+# human tag -- confirmed in production (see __init__.py's
+# handle_perform_update) as the actual, observable symptom of the known
+# network_mode:service:X daemon-conflict bug: the pull+recreate completes,
+# but the container's image field doesn't reconcile to the new tag until
+# the owning stack is restarted.
+_BARE_DIGEST_RE = re.compile(r"^(sha256:)?[0-9a-f]{64}$", re.IGNORECASE)
+
+
+def _looks_like_bare_digest(image_ref: str | None) -> bool:
+    if not image_ref:
+        return False
+    return bool(_BARE_DIGEST_RE.match(image_ref.strip()))
+
+
 # ---------------------------------------------------------------------------
 # Changelog links -- a hand-curated override table, backed by automatic
 # discovery for anything not in it.
@@ -358,13 +389,11 @@ class PortainerUpdatesCoordinator(DataUpdateCoordinator[list[dict]]):
         instead of its parent."""
         if container_device_id is None:
             return None
-        image_ref = None
-        for entity in er.async_entries_for_device(entity_reg, container_device_id):
-            if not entity.entity_id.startswith("sensor.") or not entity.entity_id.endswith("_image"):
-                continue
-            state = self.hass.states.get(entity.entity_id)
-            image_ref = state.state if state else None
-            break
+        image_entity_id = _container_image_entity_id(entity_reg, container_device_id)
+        if image_entity_id is None:
+            return None
+        state = self.hass.states.get(image_entity_id)
+        image_ref = state.state if state else None
         if not image_ref:
             return None
 

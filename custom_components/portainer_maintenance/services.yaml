@@ -64,8 +64,15 @@ perform_update:
     another container's network (network_mode: service:<other>/container:<other>
     -- a confirmed, unfixed Portainer/Docker daemon conflict, not a bug in
     this integration: see github.com/orgs/portainer/discussions/12389),
-    swallows that error and notifies that the owning stack needs a manual
-    restart to finish cleanly instead. Called by the bundled automation
+    notifies that the owning stack needs a manual restart to finish cleanly
+    instead. That specific case is told apart from a genuine failure by
+    watching what actually happens to the container's own image reference
+    over the following couple of minutes, not by matching the error's text
+    (confirmed in production that HA core wraps every recreate failure into
+    the same generic error, so the real Docker/Portainer text never reaches
+    this integration) -- which means a call against a container that's part
+    of a stack can take up to ~2.5 minutes to return on a genuine failure,
+    typically much faster otherwise. Called by the bundled automation
     blueprint's "Update now" notification action and by the companion
     ha-portainer-sidecar webapp; safe to call directly from a script or
     Developer Tools too. Returns {needs_stack_restart, stack_switch_entity_id}

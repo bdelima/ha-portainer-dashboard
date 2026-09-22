@@ -36,11 +36,25 @@ past "expose one service" into a real maintenance layer on top of the core
    Portainer's own UI, nothing to do with HA or this integration. The
    pull+recreate still actually completes despite the error, but the
    image tag only reconciles cleanly once the owning stack is restarted.
-   `perform_update` below swallows that specific error (instead of
-   aborting) and offers the phone notification's "Restart Stack Now"
-   action as a follow-up, rather than restarting automatically -- a full
-   stack restart bounces every other container in it too, which
-   shouldn't happen silently.
+   `perform_update` below catches that failure (instead of aborting) and
+   offers the phone notification's "Restart Stack Now" action as a
+   follow-up, rather than restarting automatically -- a full stack
+   restart bounces every other container in it too, which shouldn't
+   happen silently.
+
+   Telling that case apart from a genuine failure does NOT work by
+   matching the exception's text -- confirmed in production that HA
+   core's own portainer integration wraps every recreate_container
+   failure into the same generic HomeAssistantError regardless of cause,
+   so the real Docker/Portainer error text never reaches this code at
+   all. Instead, on any recreate failure for a container that's part of
+   a stack, `perform_update` watches what actually happens to that
+   container's own image reference over the following couple of minutes
+   (core's own portainer coordinator only polls Docker every 60s, so
+   this has to span at least two of its cycles): the known conflict's
+   real, observable symptom is the image reference degrading to a bare
+   content digest instead of settling on a normal tag. See
+   `_await_recreate_outcome` for the full reasoning.
 
 1d. Registers `portainer_maintenance.hide_update_entities` -- scans every
    Portainer update.* entity and hides any that aren't already hidden.
@@ -93,11 +107,19 @@ import homeassistant.util.dt as dt_util
 from homeassistant.components import frontend
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.util import slugify
 
 from .const import CONF_NOTIFY_DEVICES, CONF_WEBAPP_URL, DOMAIN, PANEL_ICON, PANEL_PATH, PANEL_TITLE
-from .sensor import _device_name, _portainer_entity_ids, _stack_info, _walk_to_root
+from .sensor import (
+    _container_image_entity_id,
+    _device_name,
+    _looks_like_bare_digest,
+    _portainer_entity_ids,
+    _stack_info,
+    _walk_to_root,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -107,6 +129,19 @@ PLATFORMS = ["sensor"]
 # restart_stack -- long enough for Docker to actually tear down the
 # network-owning container's namespace before anything tries to rejoin it.
 STACK_RESTART_SETTLE_SECONDS = 5
+
+# How long to watch a container's image reference after recreate_container
+# raises, before giving up and treating it as a genuine failure -- see
+# _await_recreate_outcome. Core's own `portainer` integration only polls
+# Docker every 60s (DEFAULT_SCAN_INTERVAL in its coordinator, confirmed
+# against its source), so this has to span at least two of ITS refresh
+# cycles, not just ours, or a recreate that lands right after a refresh
+# just completed would time out here before core ever had a chance to see
+# the change. RECREATE_WAIT_POLL_SECONDS just governs how often we check
+# our own already-local hass.states -- cheap, so no reason to wait as long
+# between checks as core does between its own Docker polls.
+RECREATE_WAIT_TIMEOUT_SECONDS = 150
+RECREATE_WAIT_POLL_SECONDS = 5
 
 SERVICE_REMOVE_DEVICE = "remove_device"
 SERVICE_REMOVE_DEVICE_SCHEMA = vol.Schema({vol.Required("device_id"): cv.string})
@@ -174,6 +209,113 @@ def _stack_switch_entity_id(hass: HomeAssistant, container_device_id: str) -> st
     entity_reg = er.async_get(hass)
     _stack_name, switch_entity_id = _stack_info(device_reg, entity_reg, container_device_id)
     return switch_entity_id
+
+
+async def _await_recreate_outcome(
+    hass: HomeAssistant,
+    image_entity_id: str | None,
+    image_before: str | None,
+    update_entity: str,
+) -> bool:
+    """Called only after recreate_container has already raised for a
+    container that IS part of a stack (see handle_perform_update) --
+    decides whether that's the known network_mode:service:X daemon
+    conflict or a genuine failure, WITHOUT trusting the exception text.
+
+    An earlier version of this code tried to tell the two apart by
+    matching the exception's string against the daemon's documented
+    error wording ("conflicting options" / "network mode"). Confirmed in
+    production that this can never work: HA core's own portainer
+    integration wraps every recreate_container failure, regardless of
+    cause, into the same generic HomeAssistantError ("An error occurred
+    while trying to connect to the Portainer instance") -- the actual
+    Docker/Portainer error text never survives to reach this code at
+    all, so the substring check was comparing against a message that
+    could never contain it.
+
+    Instead, this watches what actually happens to the container's own
+    image reference -- confirmed in production as the real, observable
+    symptom either way: the pull+recreate genuinely can complete despite
+    the daemon-level create call erroring, and when it does, the image
+    reference degrades to a bare content digest instead of a normal tag,
+    even though the underlying image content is correct. So:
+      - the image reference changes to something that looks like a bare
+        digest -> this is that known conflict; return True (needs a
+        stack restart).
+      - it changes to anything else (a normal-looking tag) -> the
+        recreate apparently completed cleanly despite the earlier
+        exception; return False.
+      - it never changes at all within RECREATE_WAIT_TIMEOUT_SECONDS ->
+        genuinely failed; raise rather than guess.
+
+    Waiting here means handle_perform_update -- a blocking service call
+    -- can now take up to RECREATE_WAIT_TIMEOUT_SECONDS to return on a
+    real failure (typically much faster on the known-conflict/success
+    paths, as soon as core's own portainer coordinator's next 60s poll
+    picks up the change). The webapp's own HTTP client timeout for this
+    call was raised to match -- see ha-portainer-sidecar's
+    ha_call_service_with_response."""
+    if image_entity_id is None:
+        # No sensor.<name>_image entity to watch at all -- nothing to
+        # judge by. Fall back to the old assumption (this recovery path
+        # only ever existed for the known conflict), rather than failing
+        # an update that might well have actually succeeded.
+        _LOGGER.warning(
+            "%s.perform_update: recreate_container raised for '%s' but no "
+            "sensor.<name>_image entity was found to watch -- assuming the "
+            "known network_mode:service:X conflict rather than a genuine "
+            "failure, since that's the only case this recovery path exists "
+            "for",
+            DOMAIN,
+            update_entity,
+        )
+        return True
+
+    elapsed = 0
+    while elapsed < RECREATE_WAIT_TIMEOUT_SECONDS:
+        await asyncio.sleep(RECREATE_WAIT_POLL_SECONDS)
+        elapsed += RECREATE_WAIT_POLL_SECONDS
+        state = hass.states.get(image_entity_id)
+        current = state.state if state else None
+        if current is None or current == image_before:
+            continue
+        if _looks_like_bare_digest(current):
+            _LOGGER.info(
+                "%s.perform_update: '%s' image reference degraded to a bare "
+                "digest ('%s') %ds after the recreate error -- confirms the "
+                "known network_mode:service:X conflict; stack restart needed",
+                DOMAIN,
+                update_entity,
+                current,
+                elapsed,
+            )
+            return True
+        _LOGGER.info(
+            "%s.perform_update: '%s' image reference changed to '%s' %ds "
+            "after the recreate error and looks like a normal tag -- "
+            "treating that error as transient, no stack restart needed",
+            DOMAIN,
+            update_entity,
+            current,
+            elapsed,
+        )
+        return False
+
+    _LOGGER.error(
+        "%s.perform_update: '%s' image reference never changed from '%s' "
+        "within %ds of the recreate error -- this does not look like the "
+        "known network_mode:service:X conflict; treating it as a genuine "
+        "failure",
+        DOMAIN,
+        update_entity,
+        image_before,
+        RECREATE_WAIT_TIMEOUT_SECONDS,
+    )
+    raise HomeAssistantError(
+        f"perform_update: recreate_container failed for {update_entity} and its "
+        f"image reference never changed within {RECREATE_WAIT_TIMEOUT_SECONDS}s -- "
+        f"this does not look like the known network_mode:service:X conflict"
+    )
 
 
 async def _async_update_done(
@@ -431,18 +573,27 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # here: Docker's daemon rejects the create call over a
         # hostname/network_mode conflict, even though the pull+recreate
         # still actually completes -- reproduced identically via Portainer's
-        # own UI, independent of HA or this integration (the daemon's own
-        # message is "conflicting options: hostname and the network mode").
-        # Swallow *that specific* error rather than aborting the whole
-        # update, and follow up with a "restart the stack" notification
-        # instead of the normal "update performed" one -- see module
-        # docstring, 1c. Any other failure -- including this same error for
-        # a standalone container, which the known bug doesn't apply to --
-        # is re-raised and fails the update normally, same as before this
-        # feature existed. This container's stack (if any) is resolved
-        # up front so that decision doesn't depend on interpreting the
-        # exception text alone.
+        # own UI, independent of HA or this integration.
+        #
+        # An earlier version of this detected that case by matching the
+        # exception's text against the daemon's documented error wording.
+        # Confirmed in production that this cannot work: HA core's own
+        # portainer integration wraps every recreate_container failure,
+        # whatever the cause, into the same generic HomeAssistantError --
+        # the real Docker/Portainer error text never reaches this code at
+        # all. So this container's image reference is captured BEFORE the
+        # call, and on any exception for a container that IS part of a
+        # stack, judgment is deferred to _await_recreate_outcome, which
+        # watches what actually happens to that image reference instead of
+        # trusting the exception text -- see its own docstring for the
+        # full reasoning. A standalone-container failure has no stack to
+        # fall back on either way, so it's re-raised immediately, same as
+        # before this feature existed.
         switch_entity_id = _stack_switch_entity_id(hass, container_device_id)
+        image_entity_id = _container_image_entity_id(entity_reg, container_device_id)
+        image_before_state = hass.states.get(image_entity_id) if image_entity_id else None
+        image_before = image_before_state.state if image_before_state else None
+
         needs_stack_restart = False
         try:
             await hass.services.async_call(
@@ -452,26 +603,29 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 blocking=True,
             )
         except Exception as err:
-            is_known_conflict = "conflicting options" in str(err).lower() and "network mode" in str(err).lower()
-            if switch_entity_id is None or not is_known_conflict:
+            if switch_entity_id is None:
                 _LOGGER.error(
-                    "%s.perform_update: recreate_container failed for '%s' (part of a "
-                    "stack: %s; matches the known network_mode:service:X daemon-conflict "
-                    "text: %s) -- re-raising, this update did not succeed",
+                    "%s.perform_update: recreate_container failed for '%s' "
+                    "(standalone container, no owning stack to fall back on) "
+                    "-- re-raising, this update did not succeed: %s",
                     DOMAIN,
                     update_entity,
-                    switch_entity_id is not None,
-                    is_known_conflict,
+                    err,
                 )
                 raise
             _LOGGER.warning(
-                "%s.perform_update: recreate_container hit the known "
-                "network_mode:service:X daemon-conflict case for '%s' -- the pull/recreate "
-                "itself completed, but the stack needs a restart to fully reconcile",
+                "%s.perform_update: recreate_container raised for '%s' (part "
+                "of a stack) -- deferring judgment to what its image "
+                "reference actually does over the next %ds, rather than "
+                "trusting the exception text: %s",
                 DOMAIN,
                 update_entity,
+                RECREATE_WAIT_TIMEOUT_SECONDS,
+                err,
             )
-            needs_stack_restart = True
+            needs_stack_restart = await _await_recreate_outcome(
+                hass, image_entity_id, image_before, update_entity
+            )
 
         # The recreate actually went through at this point (either cleanly,
         # or via the swallowed known-conflict case above) -- but the core
