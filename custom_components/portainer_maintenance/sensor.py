@@ -338,12 +338,20 @@ def _normalize_image_repo(image_ref: str) -> str | None:
     return _split_image_repo(image_ref)[1]
 
 
-def _guess_ghcr_repo_url(repo: str) -> str | None:
+def _guess_repo_url_from_path(repo: str) -> str | None:
     """A ghcr.io image path IS a GitHub owner/repo path -- e.g.
     ghcr.io/immich-app/immich-server maps to github.com/immich-app/immich-server.
-    This is a guess, not a certainty (a project can publish an image under a
-    path segment that isn't its exact repo name), which is why the caller
-    always verifies it with a live request before trusting it."""
+    This isn't ghcr.io-specific, though: it's also exactly right for any
+    project (Bob's own images included -- same username on GitHub and
+    Docker Hub, same repo name in both places) that publishes to Docker Hub
+    under a namespace/repo pair matching its GitHub owner/repo exactly, so
+    the Docker Hub/lscr.io branch below tries this same guess first, before
+    falling back to README-scraping. This is a guess, not a certainty (a
+    project can publish an image under a path segment that isn't its exact
+    repo name -- linuxserver.io's repos are named 'docker-<app>', not
+    '<app>', which is exactly the case the README-scrape fallback exists
+    for), which is why the caller always verifies it with a live request
+    before trusting it."""
     parts = repo.split("/")
     if len(parts) < 2:
         return None
@@ -487,14 +495,14 @@ class PortainerUpdatesCoordinator(DataUpdateCoordinator[list[dict]]):
         discovered: str | None = None
         try:
             if host == "ghcr.io":
-                guess = _guess_ghcr_repo_url(repo)
+                guess = _guess_repo_url_from_path(repo)
                 if guess:
-                    # _guess_ghcr_repo_url returns the repo's home page --
-                    # the actual changelog content lives on its Releases
-                    # page, not the README, so that's what gets linked and
-                    # verified (a repo with GitHub Releases disabled still
-                    # 200s on /releases with an empty list, so this check
-                    # is still meaningful even then).
+                    # _guess_repo_url_from_path returns the repo's home
+                    # page -- the actual changelog content lives on its
+                    # Releases page, not the README, so that's what gets
+                    # linked and verified (a repo with GitHub Releases
+                    # disabled still 200s on /releases with an empty list,
+                    # so this check is still meaningful even then).
                     guess_releases = f"{guess}/releases"
                     if await _verify_github_url(self.hass, guess_releases):
                         discovered = guess_releases
@@ -508,14 +516,35 @@ class PortainerUpdatesCoordinator(DataUpdateCoordinator[list[dict]]):
                 # discovery actually cover LSIO, the whole point of it.
                 "lscr.io",
             ):
-                candidate = await _fetch_dockerhub_github_url(self.hass, repo)
-                if candidate:
-                    # Same reasoning as the ghcr.io branch above -- link
-                    # and verify the Releases page, not the repo home page
-                    # scraped from the README.
-                    candidate_releases = f"{candidate}/releases"
-                    if await _verify_github_url(self.hass, candidate_releases):
-                        discovered = candidate_releases
+                # Try the direct owner/repo guess FIRST, same as ghcr.io
+                # above -- this is exactly right for any project whose
+                # Docker Hub namespace matches its GitHub owner and whose
+                # repo is named identically in both places. That's every
+                # one of Bob's own images (bdelima/ha-portainer-sidecar,
+                # bdelima/tailscale-exporter, etc: same username on both
+                # platforms, matching repo names by convention) -- and
+                # this branch used to skip straight to README-scraping,
+                # which only ever finds a link if the Docker Hub listing's
+                # description text happens to contain one. A minimal
+                # personal project's Docker Hub page frequently has no
+                # populated README at all, so the direct guess was the
+                # missing, much simpler case, not an edge case.
+                guess = _guess_repo_url_from_path(repo)
+                if guess:
+                    guess_releases = f"{guess}/releases"
+                    if await _verify_github_url(self.hass, guess_releases):
+                        discovered = guess_releases
+                if discovered is None:
+                    # Falls back to README-scraping only when the direct
+                    # guess doesn't verify -- the case this exists for is
+                    # linuxserver.io, whose GitHub repos are named
+                    # "docker-<app>", not "<app>", so lscr.io/linuxserver/plex
+                    # can never resolve via the direct guess above.
+                    candidate = await _fetch_dockerhub_github_url(self.hass, repo)
+                    if candidate:
+                        candidate_releases = f"{candidate}/releases"
+                        if await _verify_github_url(self.hass, candidate_releases):
+                            discovered = candidate_releases
             # Any other registry host (private/self-hosted) -- no generic,
             # credential-free way to discover from here; discovered stays
             # None, same as an unmapped image before this feature existed.
