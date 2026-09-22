@@ -25,13 +25,16 @@ auto-suffix these as _2 to avoid colliding with the old ones.
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timedelta
+
+import aiohttp
 
 import homeassistant.util.dt as dt_util
 from homeassistant.components.sensor import SensorEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers import device_registry as dr, entity_registry as er
+from homeassistant.helpers import aiohttp_client, device_registry as dr, entity_registry as er
 from homeassistant.helpers.device_registry import DeviceEntryType
 from homeassistant.helpers.entity import DeviceInfo, EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -131,6 +134,176 @@ def _stack_info(
 
 
 # ---------------------------------------------------------------------------
+# Changelog links -- a hand-curated override table, backed by automatic
+# discovery for anything not in it.
+#
+# The core portainer integration's update.* entities carry no changelog
+# data at all (confirmed: they're pure digest comparisons -- installed/
+# latest_version are raw SHA256 hashes, not semantic tags, and neither
+# release_summary nor release_url is ever set). Reading it from the
+# image's own OCI labels (org.opencontainers.image.source) was considered
+# and rejected: it needs its own Portainer API credentials (a new,
+# separate setup field this integration doesn't otherwise require), and
+# even then, coverage is inconsistent -- confirmed present on some
+# GHCR/GitHub-Actions-built images (e.g. gluetun), confirmed ABSENT on
+# linuxserver.io images (a large share of a typical homelab), which set
+# only build_version/maintainer labels, no OCI annotations at all.
+#
+# Instead of reading labels, discovery reads the same two public places a
+# web search on an image tag tends to surface a GitHub link from -- just
+# directly, without going through a search engine (which would mean
+# scraping search-result HTML with no sanctioned API, and realistically
+# getting rate-limited/CAPTCHA'd by a home server hitting it repeatedly):
+#   - ghcr.io images: the image path *is* a GitHub owner/repo path, so the
+#     URL is a direct guess (verified with a live request before use, not
+#     assumed correct).
+#   - Docker Hub images (this is what covers LSIO): Docker Hub's own public
+#     repository API returns the README text, which conventionally links
+#     back to the upstream GitHub repo; the first plausible match is
+#     extracted and, again, verified live before use.
+# Both lookups happen at most once per distinct image repo path -- the
+# result (including "nothing found") is cached on the coordinator for the
+# life of the integration, so this never runs on every 5-minute poll, only
+# the first time a given image is seen with a pending update.
+#
+# The table below is an override, checked first and always wins over
+# whatever discovery would find -- useful when an image's Docker
+# Hub/registry path doesn't match its real upstream repo (Home Assistant's
+# own image is kept here for exactly that reason) or when discovery simply
+# can't reach a conclusion (a private/self-hosted registry, or a Docker
+# Hub README with no usable link). Nothing needs to be added here anymore
+# for the common case -- add an entry only to correct or guarantee a
+# specific mapping.
+#
+# Keys are the image reference's repository path ONLY -- no registry
+# host, no tag, no digest (see _split_image_repo). A few projects publish
+# multiple image variants (different base OS/arch) under different repo
+# paths for the same upstream project; add one entry per variant actually
+# in use rather than trying to pattern-match them.
+#
+# Plex is deliberately not here, and discovery will never find it either:
+# Plex Media Server is closed-source, so there is no public GitHub
+# releases page to link to at all -- not a gap in this table or in
+# discovery, an inherent limit of the upstream project.
+_KNOWN_CHANGELOG_URLS: dict[str, str] = {
+    "homeassistant/home-assistant": "https://github.com/home-assistant/core/releases",
+    "qmcgaw/gluetun": "https://github.com/qdm12/gluetun/releases",
+    "portainer/portainer-ce": "https://github.com/portainer/portainer/releases",
+}
+
+# Docker Hub README links that are never the project's own repo -- GitHub
+# path segments that happen to look like an "owner" but are actually a
+# platform feature.
+_GITHUB_NON_REPO_OWNERS = {
+    "sponsors", "apps", "marketplace", "orgs", "settings", "about",
+    "features", "pricing", "topics", "collections", "trending", "explore",
+    "login", "join", "search",
+}
+_GITHUB_URL_RE = re.compile(
+    r"https?://github\.com/([A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?)/([A-Za-z0-9._-]+)"
+)
+
+
+def _split_image_repo(image_ref: str) -> tuple[str | None, str | None]:
+    """'lscr.io/linuxserver/plex:1.32.5' -> ('lscr.io', 'linuxserver/plex').
+    Strips a digest (@sha256:...), a tag (:latest), and a leading registry
+    host (anything before the first '/' that looks like a host -- contains
+    a '.' or ':', or is exactly 'localhost' -- since a bare Docker Hub
+    image has no host segment at all, e.g. 'homeassistant/home-assistant'
+    with no leading docker.io/). host is None when the ref has no explicit
+    registry host (i.e. it's Docker Hub). Returns (None, None) for an
+    empty/unparseable ref."""
+    if not image_ref:
+        return None, None
+    ref = image_ref.split("@", 1)[0]  # drop a digest, if present
+
+    parts = ref.split("/")
+    host = None
+    if len(parts) > 1 and ("." in parts[0] or ":" in parts[0] or parts[0] == "localhost"):
+        host = parts[0]
+        parts = parts[1:]  # drop the registry host segment
+    ref = "/".join(parts)
+
+    # Drop a trailing :tag -- but only the last segment's ':', since a
+    # registry host earlier in the ref (already stripped above, but just
+    # in case) could itself contain one.
+    if ":" in ref.rsplit("/", 1)[-1]:
+        ref = ref.rsplit(":", 1)[0]
+
+    return host, (ref or None)
+
+
+def _normalize_image_repo(image_ref: str) -> str | None:
+    """Repo-path-only convenience wrapper around _split_image_repo, kept
+    for callers that only care about the table-lookup key."""
+    return _split_image_repo(image_ref)[1]
+
+
+def _guess_ghcr_repo_url(repo: str) -> str | None:
+    """A ghcr.io image path IS a GitHub owner/repo path -- e.g.
+    ghcr.io/immich-app/immich-server maps to github.com/immich-app/immich-server.
+    This is a guess, not a certainty (a project can publish an image under a
+    path segment that isn't its exact repo name), which is why the caller
+    always verifies it with a live request before trusting it."""
+    parts = repo.split("/")
+    if len(parts) < 2:
+        return None
+    return f"https://github.com/{parts[0]}/{parts[1]}"
+
+
+def _first_github_repo_url(text: str) -> str | None:
+    """Pull the first plausible github.com/<owner>/<repo> URL out of free
+    text (a Docker Hub README), skipping GitHub path segments that are
+    platform features rather than a user/org (github.com/sponsors/...)."""
+    if not text:
+        return None
+    for match in _GITHUB_URL_RE.finditer(text):
+        owner, name = match.group(1), match.group(2)
+        if owner.lower() in _GITHUB_NON_REPO_OWNERS:
+            continue
+        name = name.rstrip(").,]>\"'")
+        if not name:
+            continue
+        return f"https://github.com/{owner}/{name}"
+    return None
+
+
+async def _fetch_dockerhub_github_url(hass: HomeAssistant, repo: str) -> str | None:
+    """Reads the repo's public Docker Hub page data (no auth needed for a
+    public repo) and extracts a GitHub link from its README text, the same
+    text a web search on the image tag tends to surface a GitHub result
+    from in the first place -- just read directly instead of through a
+    search engine. 'redis' (a Docker Official Image, no namespace) lives
+    under the 'library' namespace on Docker Hub's API."""
+    parts = repo.split("/")
+    namespace, name = ("library", parts[0]) if len(parts) == 1 else (parts[0], parts[1])
+    session = aiohttp_client.async_get_clientsession(hass)
+    api_url = f"https://hub.docker.com/v2/repositories/{namespace}/{name}/"
+    try:
+        async with session.get(api_url, timeout=aiohttp.ClientTimeout(total=6)) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json(content_type=None)
+    except (aiohttp.ClientError, TimeoutError, ValueError):
+        return None
+    text = (data.get("full_description") or data.get("description") or "") if isinstance(data, dict) else ""
+    return _first_github_repo_url(text)
+
+
+async def _verify_github_url(hass: HomeAssistant, url: str) -> bool:
+    """A guessed/scraped URL is only trusted once it's confirmed live --
+    this is what turns "probably right" into "actually resolves right
+    now", at the cost of one HTTPS round trip, done once per repo and
+    cached after that (see PortainerUpdatesCoordinator._changelog_cache)."""
+    session = aiohttp_client.async_get_clientsession(hass)
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=5), allow_redirects=True) as resp:
+            return resp.status == 200
+    except (aiohttp.ClientError, TimeoutError):
+        return False
+
+
+# ---------------------------------------------------------------------------
 # Coordinators -- one per sensor, matching the original recompute cadence.
 # ---------------------------------------------------------------------------
 
@@ -158,6 +331,12 @@ class PortainerUpdatesCoordinator(DataUpdateCoordinator[list[dict]]):
     def __init__(self, hass: HomeAssistant) -> None:
         super().__init__(hass, _LOGGER, name=SENSOR_UPDATES_PENDING, update_interval=timedelta(minutes=5))
         self._recently_confirmed: dict[str, datetime] = {}
+        # Changelog-URL discovery result per normalized image repo path,
+        # including a cached None for "looked, found nothing" -- so a
+        # never-mapped image (or one whose registry/README yields nothing
+        # useful) is only ever attempted once per HA restart, not every
+        # 5-minute poll.
+        self._changelog_cache: dict[str, str | None] = {}
 
     def mark_recently_updated(self, update_entity: str) -> None:
         """Called by __init__.py's perform_update once a recreate for this
@@ -165,6 +344,71 @@ class PortainerUpdatesCoordinator(DataUpdateCoordinator[list[dict]]):
         network_mode:service:X daemon-conflict case) -- see
         RECENTLY_CONFIRMED_GRACE above for why this exists."""
         self._recently_confirmed[update_entity] = dt_util.utcnow()
+
+    async def _resolve_changelog_url(
+        self, entity_reg: er.EntityRegistry, container_device_id: str | None
+    ) -> str | None:
+        """The changelog/releases URL for a container's current image:
+        the manual override table if it's listed there, otherwise an
+        auto-discovery attempt (cached after the first try, successful or
+        not). Reads the sibling sensor.<name>_image entity core's
+        portainer integration already creates on the same device -- same
+        "look at what's already on this device" pattern _stack_info uses
+        for a stack's switch entity, just on the container's own device
+        instead of its parent."""
+        if container_device_id is None:
+            return None
+        image_ref = None
+        for entity in er.async_entries_for_device(entity_reg, container_device_id):
+            if not entity.entity_id.startswith("sensor.") or not entity.entity_id.endswith("_image"):
+                continue
+            state = self.hass.states.get(entity.entity_id)
+            image_ref = state.state if state else None
+            break
+        if not image_ref:
+            return None
+
+        host, repo = _split_image_repo(image_ref)
+        if not repo:
+            return None
+
+        known = _KNOWN_CHANGELOG_URLS.get(repo)
+        if known:
+            return known
+
+        if repo in self._changelog_cache:
+            return self._changelog_cache[repo]
+
+        discovered: str | None = None
+        try:
+            if host == "ghcr.io":
+                guess = _guess_ghcr_repo_url(repo)
+                if guess and await _verify_github_url(self.hass, guess):
+                    discovered = guess
+            elif host is None or host in (
+                "docker.io", "index.docker.io", "registry-1.docker.io",
+                # lscr.io is linuxserver.io's own pull-through mirror of
+                # their Docker Hub images, at identical namespace/repo
+                # paths (documented by linuxserver.io itself) -- so it's
+                # the exact same lookup as a real Docker Hub image, just
+                # pulled through a different hostname. This is what makes
+                # discovery actually cover LSIO, the whole point of it.
+                "lscr.io",
+            ):
+                candidate = await _fetch_dockerhub_github_url(self.hass, repo)
+                if candidate and await _verify_github_url(self.hass, candidate):
+                    discovered = candidate
+            # Any other registry host (private/self-hosted) -- no generic,
+            # credential-free way to discover from here; discovered stays
+            # None, same as an unmapped image before this feature existed.
+        except Exception:  # never let a discovery hiccup break a poll cycle
+            _LOGGER.debug("%s: changelog auto-discovery failed for %s", DOMAIN, repo, exc_info=True)
+            discovered = None
+
+        self._changelog_cache[repo] = discovered
+        if discovered:
+            _LOGGER.info("%s: auto-discovered changelog URL for %s -> %s", DOMAIN, repo, discovered)
+        return discovered
 
     async def _async_update_data(self) -> list[dict]:
         entity_reg = er.async_get(self.hass)
@@ -210,6 +454,7 @@ class PortainerUpdatesCoordinator(DataUpdateCoordinator[list[dict]]):
             host = _device_name(device_reg, root_id) or "unknown host"
             friendly_name = state.attributes.get("friendly_name", entity_id)
             stack_name, stack_switch_entity_id = _stack_info(device_reg, entity_reg, device_id)
+            changelog_url = await self._resolve_changelog_url(entity_reg, device_id)
 
             found.append(
                 {
@@ -221,6 +466,10 @@ class PortainerUpdatesCoordinator(DataUpdateCoordinator[list[dict]]):
                     # a flat "Standalone" bucket instead of a named stack.
                     "stack_name": stack_name,
                     "stack_switch_entity_id": stack_switch_entity_id,
+                    # None when there's no override AND discovery couldn't
+                    # verify a link (or the registry isn't one it knows how
+                    # to read) -- the dashboard just omits the link.
+                    "changelog_url": changelog_url,
                 }
             )
 
