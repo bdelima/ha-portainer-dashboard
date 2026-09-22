@@ -128,3 +128,19 @@ restart_stack:
       selector:
         entity:
           domain: switch
+
+hide_update_entities:
+  name: Hide update entities
+  description: >-
+    Scans every Portainer update.* entity and hides any that aren't
+    already hidden (entity_registry hidden_by). Closes a manual
+    per-new-container setup step -- a newly-added container's update
+    entity used to have to be found and hidden by hand to avoid update
+    badge clutter in the Settings UI, since its actual pending/not state
+    is meant to be reviewed on the dashboard instead. Called
+    automatically by the bundled automation blueprint at HA startup and
+    whenever a new entity is registered; safe to call directly too.
+    Re-hides an entity a user manually un-hid on the next run --
+    intentional, not a bug: this system's design goal is that these
+    entities' state belongs on the dashboard, not HA's own entity list.
+    Takes no fields; always scans every Portainer update.* entity.

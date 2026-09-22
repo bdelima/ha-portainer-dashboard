@@ -2,14 +2,15 @@ alias: "Portainer Maintenance"
 blueprint:
   name: "Portainer Maintenance"
   description: >-
-    All six live Portainer automations -- notify on update available,
-    handle "Update now", handle "Dismiss", startup recheck for missed
-    updates, notify on container trouble, notify on stale devices -- merged
-    into a single automation: multiple triggers, each tagged with an id,
-    dispatched via choose/trigger-id branching. One blueprint, one
-    automation, instead of six of each. Installed automatically by the
-    Portainer Maintenance integration -- this file is regenerated on every
-    integration load, so don't hand-edit this deployed copy.
+    Every live Portainer automation -- notify on update available, handle
+    "Update now", handle "Dismiss", offer a stack restart when an update
+    needs one, startup recheck for missed updates, notify on container
+    trouble, notify on stale devices, keep update.* entities hidden --
+    merged into a single automation: multiple triggers, each tagged with
+    an id, dispatched via choose/trigger-id branching. One blueprint, one
+    automation, instead of one per behavior. Installed automatically by
+    the Portainer Maintenance integration -- this file is regenerated on
+    every integration load, so don't hand-edit this deployed copy.
 
     Update-available detection triggers off sensor.portainer_updates_pending
     rather than listening to state_changed system-wide: that sensor's own
@@ -62,6 +63,9 @@ trigger:
   - id: stale_devices
     trigger: state
     entity_id: sensor.portainer_stale_devices
+  - id: entity_registry_updated
+    trigger: event
+    event_type: entity_registry_updated
 
 action:
   - variables:
@@ -158,6 +162,11 @@ action:
             continue_on_timeout: true
           - delay:
               seconds: 30
+          # Hide any Portainer update.* entity that isn't hidden yet --
+          # covers anything that existed before this feature shipped, or
+          # slipped through some other way. Ongoing coverage for entities
+          # created *after* startup is branch 8, below.
+          - action: portainer_maintenance.hide_update_entities
           # Force our own coordinator to re-scan right now -- its own
           # first-refresh-at-startup can land before the portainer
           # integration's update.* entities are actually populated
@@ -228,7 +237,30 @@ action:
                       clickAction: "{{ states('sensor.portainer_actions_url') }}"
                       url: "{{ states('sensor.portainer_actions_url') }}"
 
-  # 8. Sidebar notification-bell badge: HA's own persistent_notification
+      # 8. Hide a newly-registered update entity
+      #    Ongoing counterpart to branch 5's startup sweep -- fires the
+      #    moment a new container's update.* entity is registered (rather
+      #    than waiting for the next HA restart), so a container added at
+      #    any time gets its update entity hidden automatically. Filters
+      #    entity_registry_updated (which fires for every entity in the
+      #    house, any integration) down to just a newly-created update.*
+      #    entity belonging to the portainer platform, via the same
+      #    config_entry_id()/config_entry_attr() dynamic-scoping pattern
+      #    used everywhere else in this design. Re-scans everything rather
+      #    than hiding just the one entity -- cheap, and self-healing
+      #    against anything else that slipped through.
+      - conditions:
+          - condition: trigger
+            id: entity_registry_updated
+          - condition: template
+            value_template: >
+              {{ trigger.event.data.action == 'create'
+                 and trigger.event.data.entity_id.startswith('update.')
+                 and config_entry_attr(config_entry_id(trigger.event.data.entity_id), 'domain') == 'portainer' }}
+        sequence:
+          - action: portainer_maintenance.hide_update_entities
+
+  # 9. Sidebar notification-bell badge: HA's own persistent_notification
   # count (the bell icon, top of the sidebar) is native and needs no
   # third-party plugin, unlike a badge on the panel item itself, which
   # HA's frontend doesn't expose to custom integrations at all. Recomputed

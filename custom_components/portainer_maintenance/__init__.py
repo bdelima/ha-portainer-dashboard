@@ -42,6 +42,15 @@ past "expose one service" into a real maintenance layer on top of the core
    stack restart bounces every other container in it too, which
    shouldn't happen silently.
 
+1d. Registers `portainer_maintenance.hide_update_entities` -- scans every
+   Portainer update.* entity and hides any that aren't already hidden.
+   Closes a manual per-new-container setup step (Setup steps used to say
+   "hide its update.* entity" as an ongoing chore) the same way the
+   services above closed manual steps for their own areas. The blueprint
+   calls this at HA startup and whenever a new entity_registry entry is
+   created, so a newly-added container's update entity gets hidden
+   automatically instead of needing to be found and hidden by hand.
+
 2. Installs its bundled automation blueprint into HA's config dir
    automatically (see bundled_blueprints/) -- no more separate SSH deploy
    step for that. Re-copied on every load, so treat the deployed copy as
@@ -123,6 +132,9 @@ SERVICE_UPDATE_DONE_SCHEMA = vol.Schema(
 
 SERVICE_RESTART_STACK = "restart_stack"
 SERVICE_RESTART_STACK_SCHEMA = vol.Schema({vol.Required("switch_entity_id"): cv.entity_id})
+
+SERVICE_HIDE_UPDATE_ENTITIES = "hide_update_entities"
+SERVICE_HIDE_UPDATE_ENTITIES_SCHEMA = vol.Schema({})
 
 BUNDLED_BLUEPRINTS_DIR = Path(__file__).parent / "bundled_blueprints"
 
@@ -543,6 +555,56 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             schema=SERVICE_RESTART_STACK_SCHEMA,
         )
 
+    async def handle_hide_update_entities(call: ServiceCall) -> dict:
+        """Scan every Portainer update.* entity and hide any that aren't
+        already hidden -- closes the "hide its update.* entity" manual
+        step Setup steps used to call out as a per-new-container chore.
+        Reuses the same dynamic config-entry-domain scan as the tracking
+        sensors, so a newly-added host/container needs nothing configured
+        here either. Called by the blueprint's own startup sweep and its
+        entity_registry_updated trigger -- see the blueprint for both.
+
+        Only touches entities with hidden_by is None (never hidden at
+        all) -- an entity a user explicitly re-showed also has
+        hidden_by None, so this will re-hide it on the next sweep too.
+        That's intentional, not an oversight: this system's whole design
+        goal is that these entities' state belongs on the dashboard, not
+        in HA's own entity list, so "make sure they're hidden" is meant
+        as ongoing enforcement, not a one-time nudge. If that ever needs
+        to change, the fix is a per-entity opt-out, not removing the
+        enforcement."""
+        entity_reg = er.async_get(hass)
+        scanned = 0
+        hidden = 0
+        for entity_id in _portainer_entity_ids(entity_reg):
+            if not entity_id.startswith("update."):
+                continue
+            scanned += 1
+            reg_entry = entity_reg.async_get(entity_id)
+            if reg_entry is None or reg_entry.hidden_by is not None:
+                continue
+            entity_reg.async_update_entity(entity_id, hidden_by=er.RegistryEntryHider.INTEGRATION)
+            hidden += 1
+            _LOGGER.info("%s.hide_update_entities: hid %s (was visible)", DOMAIN, entity_id)
+
+        if hidden:
+            _LOGGER.info(
+                "%s.hide_update_entities: hid %d of %d update entities scanned",
+                DOMAIN,
+                hidden,
+                scanned,
+            )
+        return {"scanned": scanned, "hidden": hidden}
+
+    if not hass.services.has_service(DOMAIN, SERVICE_HIDE_UPDATE_ENTITIES):
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_HIDE_UPDATE_ENTITIES,
+            handle_hide_update_entities,
+            schema=SERVICE_HIDE_UPDATE_ENTITIES_SCHEMA,
+            supports_response=SupportsResponse.OPTIONAL,
+        )
+
     await hass.async_add_executor_job(_install_blueprints, hass)
 
     webapp_url = entry.data[CONF_WEBAPP_URL]
@@ -579,4 +641,5 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             hass.services.async_remove(DOMAIN, SERVICE_PERFORM_UPDATE)
             hass.services.async_remove(DOMAIN, SERVICE_UPDATE_DONE)
             hass.services.async_remove(DOMAIN, SERVICE_RESTART_STACK)
+            hass.services.async_remove(DOMAIN, SERVICE_HIDE_UPDATE_ENTITIES)
     return unload_ok
