@@ -24,6 +24,7 @@ auto-suffix these as _2 to avoid colliding with the old ones.
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 from datetime import datetime, timedelta
@@ -222,6 +223,73 @@ _KNOWN_CHANGELOG_URLS: dict[str, str] = {
     "portainer/portainer-ce": "https://github.com/portainer/portainer/releases",
 }
 
+# A runtime, no-rebuild-required override file, checked BEFORE
+# _KNOWN_CHANGELOG_URLS above -- editing that dict means shipping a new
+# integration release just to add or fix one URL. This file lives in HA's
+# own config directory (next to configuration.yaml -- resolved via
+# hass.config.path so it's correct on any install, not hardcoded to one of
+# Bob's hosts), survives every integration update/reinstall since it's
+# outside custom_components/ entirely, and is re-read on every resolution
+# attempt for an unmapped repo (see _load_changelog_overrides below) -- so
+# an edit takes effect on the next 5-minute poll, no HA restart needed.
+# Same key format as _KNOWN_CHANGELOG_URLS: the image's repo path only, no
+# registry host/tag/digest. On a key collision between this file and
+# _KNOWN_CHANGELOG_URLS, this file always wins -- it's the override
+# mechanism, the built-in table is just the shipped defaults underneath it.
+CHANGELOG_OVERRIDES_FILENAME = "portainer_maintenance_changelog_overrides.json"
+
+
+def _load_changelog_overrides_sync(path: str) -> dict[str, str]:
+    """Blocking file read -- never call this directly from a coroutine;
+    always go through _load_changelog_overrides, which offloads it to HA's
+    executor (recent HA versions warn/error on blocking I/O straight on the
+    event loop). A missing file is the normal, common case (nobody's added
+    an override yet) and logged at debug only; a present-but-malformed file
+    is logged at warning, since that's a typo Bob would want to know about,
+    and either way this returns an empty dict rather than raising -- a bad
+    override file must never break changelog resolution for every other
+    container."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        _LOGGER.debug("%s: no changelog overrides file at %s", DOMAIN, path)
+        return {}
+    except (OSError, json.JSONDecodeError) as exc:
+        _LOGGER.warning("%s: couldn't read changelog overrides file %s: %s", DOMAIN, path, exc)
+        return {}
+
+    if not isinstance(data, dict):
+        _LOGGER.warning(
+            "%s: changelog overrides file %s must be a JSON object of "
+            '"image/repo": "url" entries -- ignoring the whole file',
+            DOMAIN, path,
+        )
+        return {}
+
+    overrides: dict[str, str] = {}
+    for key, value in data.items():
+        if isinstance(key, str) and key and isinstance(value, str) and value:
+            overrides[key] = value
+        else:
+            _LOGGER.warning(
+                "%s: ignoring invalid entry in changelog overrides file (%r -> %r) -- "
+                "both the image/repo key and the URL value must be non-empty strings",
+                DOMAIN, key, value,
+            )
+    return overrides
+
+
+async def _load_changelog_overrides(hass: HomeAssistant) -> dict[str, str]:
+    """See CHANGELOG_OVERRIDES_FILENAME above for the precedence/reload
+    story. Cheap enough (a small local JSON file, read at most once per
+    unmapped repo per 5-minute poll) that no additional caching is needed
+    here beyond PortainerUpdatesCoordinator's existing _changelog_cache,
+    which this sits in front of."""
+    path = hass.config.path(CHANGELOG_OVERRIDES_FILENAME)
+    return await hass.async_add_executor_job(_load_changelog_overrides_sync, path)
+
+
 # Docker Hub README links that are never the project's own repo -- GitHub
 # path segments that happen to look like an "owner" but are actually a
 # platform feature.
@@ -379,14 +447,17 @@ class PortainerUpdatesCoordinator(DataUpdateCoordinator[list[dict]]):
     async def _resolve_changelog_url(
         self, entity_reg: er.EntityRegistry, container_device_id: str | None
     ) -> str | None:
-        """The changelog/releases URL for a container's current image:
-        the manual override table if it's listed there, otherwise an
-        auto-discovery attempt (cached after the first try, successful or
-        not). Reads the sibling sensor.<name>_image entity core's
-        portainer integration already creates on the same device -- same
-        "look at what's already on this device" pattern _stack_info uses
-        for a stack's switch entity, just on the container's own device
-        instead of its parent."""
+        """The changelog/releases URL for a container's current image, in
+        precedence order: (1) CHANGELOG_OVERRIDES_FILENAME, a JSON file in
+        HA's config directory Bob can edit directly with no rebuild/release
+        needed -- see that constant's comment for the full story and file
+        format; (2) the built-in _KNOWN_CHANGELOG_URLS table, the shipped
+        defaults; (3) an auto-discovery attempt (cached after the first
+        try, successful or not). Reads the sibling sensor.<name>_image
+        entity core's portainer integration already creates on the same
+        device -- same "look at what's already on this device" pattern
+        _stack_info uses for a stack's switch entity, just on the
+        container's own device instead of its parent."""
         if container_device_id is None:
             return None
         image_entity_id = _container_image_entity_id(entity_reg, container_device_id)
@@ -401,6 +472,11 @@ class PortainerUpdatesCoordinator(DataUpdateCoordinator[list[dict]]):
         if not repo:
             return None
 
+        overrides = await _load_changelog_overrides(self.hass)
+        override = overrides.get(repo)
+        if override:
+            return override
+
         known = _KNOWN_CHANGELOG_URLS.get(repo)
         if known:
             return known
@@ -412,8 +488,16 @@ class PortainerUpdatesCoordinator(DataUpdateCoordinator[list[dict]]):
         try:
             if host == "ghcr.io":
                 guess = _guess_ghcr_repo_url(repo)
-                if guess and await _verify_github_url(self.hass, guess):
-                    discovered = guess
+                if guess:
+                    # _guess_ghcr_repo_url returns the repo's home page --
+                    # the actual changelog content lives on its Releases
+                    # page, not the README, so that's what gets linked and
+                    # verified (a repo with GitHub Releases disabled still
+                    # 200s on /releases with an empty list, so this check
+                    # is still meaningful even then).
+                    guess_releases = f"{guess}/releases"
+                    if await _verify_github_url(self.hass, guess_releases):
+                        discovered = guess_releases
             elif host is None or host in (
                 "docker.io", "index.docker.io", "registry-1.docker.io",
                 # lscr.io is linuxserver.io's own pull-through mirror of
@@ -425,8 +509,13 @@ class PortainerUpdatesCoordinator(DataUpdateCoordinator[list[dict]]):
                 "lscr.io",
             ):
                 candidate = await _fetch_dockerhub_github_url(self.hass, repo)
-                if candidate and await _verify_github_url(self.hass, candidate):
-                    discovered = candidate
+                if candidate:
+                    # Same reasoning as the ghcr.io branch above -- link
+                    # and verify the Releases page, not the repo home page
+                    # scraped from the README.
+                    candidate_releases = f"{candidate}/releases"
+                    if await _verify_github_url(self.hass, candidate_releases):
+                        discovered = candidate_releases
             # Any other registry host (private/self-hosted) -- no generic,
             # credential-free way to discover from here; discovered stays
             # None, same as an unmapped image before this feature existed.
@@ -481,14 +570,27 @@ class PortainerUpdatesCoordinator(DataUpdateCoordinator[list[dict]]):
             device_id = reg_entry.device_id if reg_entry else None
             root_id = _walk_to_root(device_reg, device_id)
             host = _device_name(device_reg, root_id) or "unknown host"
-            friendly_name = state.attributes.get("friendly_name", entity_id)
+            # The CONTAINER's own device name, not the update entity's
+            # friendly_name -- core's portainer integration names update.*
+            # entities things like "resilio-sync Image update available",
+            # which is fine as an entity name but reads badly wherever this
+            # "name" field gets dropped into a sentence (the webapp's row
+            # label, and the automation blueprint's "Update available" push
+            # message both use it directly). PortainerTroubleCoordinator and
+            # PortainerStaleCoordinator below already do it this way; this
+            # brings updates_pending in line with them instead of falling
+            # back to the entity's own friendly_name unless the device
+            # lookup genuinely comes up empty.
+            container_name = _device_name(device_reg, device_id) or state.attributes.get(
+                "friendly_name", entity_id
+            )
             stack_name, stack_switch_entity_id = _stack_info(device_reg, entity_reg, device_id)
             changelog_url = await self._resolve_changelog_url(entity_reg, device_id)
 
             found.append(
                 {
                     "entity": entity_id,
-                    "name": f"{friendly_name} ({host})",
+                    "name": f"{container_name} ({host})",
                     "secondary_info": "Update available",
                     # None/None for a standalone container not part of a
                     # stack -- the dashboard's tree view groups those under

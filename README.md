@@ -13,7 +13,14 @@ On setup, this integration:
 - Exposes three native tracking sensors — `sensor.portainer_updates_pending`, `sensor.portainer_container_trouble`, and `sensor.portainer_stale_devices` — replacing what used to be hand-maintained YAML template sensors.
 - Keeps a native HA notification (the bell icon at the top of the sidebar) up to date with a running total across all three sensors whenever anything needs attention, and dismisses it once everything's clear — a real badge/count indicator with no third-party sidebar plugin needed.
 - Registers `portainer_maintenance.hide_update_entities` and calls it automatically (at startup, and whenever a new Portainer `update.*` entity is created) — hides that entity from HA's own entity list so it doesn't clutter Settings, since its actual pending/not-pending state is meant to be reviewed on the dashboard instead. Closes what used to be a manual "remember to hide it" step for every new container.
-- Attaches a `changelog_url` to each item in `sensor.portainer_updates_pending` when one can be found, surfaced by the webapp as a "Changelog" link next to Install. A small hand-curated table covers a few pinned images directly; everything else is resolved automatically — a `ghcr.io` image's path is checked directly against GitHub, and a Docker Hub (or `lscr.io`) image has its public README scanned for a GitHub link — with any guess verified live before it's used, and the result cached so this only costs a network round trip once per image ever seen with a pending update.
+- Attaches a `changelog_url` to each item in `sensor.portainer_updates_pending` when one can be found, surfaced by the webapp as a "Changelog" link next to Install, always pointed at the project's GitHub *Releases* page rather than its repo home page. A small hand-curated table covers a few pinned images directly; everything else is resolved automatically — a `ghcr.io` image's path is checked directly against GitHub, and a Docker Hub (or `lscr.io`) image has its public README scanned for a GitHub link — with any guess verified live before it's used, and the result cached so this only costs a network round trip once per image ever seen with a pending update.
+  - **Overriding a changelog link without a new release:** drop a JSON file named `portainer_maintenance_changelog_overrides.json` in your Home Assistant config directory (the same folder as `configuration.yaml`) with entries shaped `{"owner/repo-path": "https://..."}`, keyed by the image's repo path exactly as it appears in the image reference (no registry host, tag, or digest — e.g. `qmcgaw/gluetun`, not `ghcr.io/qmcgaw/gluetun:latest`). This file always wins over the integration's own built-in table when both have an entry for the same image, and is re-read on the next 5-minute poll — no HA restart, no new integration version. Example:
+    ```json
+    {
+      "myorg/myimage": "https://github.com/myorg/myimage/releases",
+      "someowner/some-fork": "https://github.com/someowner/some-fork/releases"
+    }
+    ```
 
 ## Requirements
 
