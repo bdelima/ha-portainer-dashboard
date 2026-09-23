@@ -182,6 +182,17 @@ action:
                       tag: "portainer_updates_pending"
                       clickAction: "{{ states('sensor.portainer_actions_url') }}"
                       url: "{{ states('sensor.portainer_actions_url') }}"
+                      # (1.3.1) Every notification in this system is
+                      # meant to carry a no-op Dismiss -- tapping any
+                      # action clears it from the tray, so this just gives
+                      # an explicit "I saw this" option with nothing to
+                      # listen for anywhere. The __init__.py-side pushes
+                      # (update performed, stack restart needed) picked
+                      # this up in 1.3.0; this blueprint-issued push was
+                      # missed at the time.
+                      actions:
+                        - action: "dismiss"
+                          title: "Dismiss"
 
       # 6. Notify on trouble -- (1.3.0) sensor.portainer_trouble broadened
       #    past individual containers to also cover an endpoint that's
@@ -210,6 +221,10 @@ action:
                       channel: alarm_stream
                       clickAction: "{{ states('sensor.portainer_actions_url') }}#trouble"
                       url: "{{ states('sensor.portainer_actions_url') }}#trouble"
+                      # (1.3.1) See the matching note on branch 5 above.
+                      actions:
+                        - action: "dismiss"
+                          title: "Dismiss"
 
       # 7. Report stale Portainer devices
       - conditions:
@@ -231,6 +246,10 @@ action:
                       tag: "portainer_stale_devices"
                       clickAction: "{{ states('sensor.portainer_actions_url') }}"
                       url: "{{ states('sensor.portainer_actions_url') }}"
+                      # (1.3.1) See the matching note on branch 5 above.
+                      actions:
+                        - action: "dismiss"
+                          title: "Dismiss"
 
       # 8. Hide a newly-registered update entity
       #    Ongoing counterpart to branch 5's startup sweep -- fires the

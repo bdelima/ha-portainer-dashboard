@@ -91,6 +91,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import device_registry as dr, entity_registry as er
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import slugify
 
 from .const import CONF_NOTIFY_DEVICES, CONF_WEBAPP_URL, DOMAIN, PANEL_ICON, PANEL_PATH, PANEL_TITLE
@@ -195,23 +196,45 @@ def _stack_switch_entity_id(hass: HomeAssistant, container_device_id: str) -> st
     return switch_entity_id
 
 
-async def _refresh_after_action(hass: HomeAssistant, entity_ids: list[str | None]) -> None:
+async def _refresh_after_action(
+    hass: HomeAssistant,
+    entity_ids: list[str | None],
+    also_refresh: DataUpdateCoordinator | None = None,
+) -> None:
     """Fire-then-nudge shared by prune_images and prune_volumes -- see
     PRUNE_REFRESH_PRE_DELAY_SECONDS/POST_DELAY_SECONDS above for the
     reasoning. Silently does nothing if none of the target entities were
     found (e.g. a suffix-matching assumption in sensor.py didn't hold on
     this particular HA version) -- a missing refresh target should never
-    fail the underlying prune action itself."""
+    fail the underlying prune action itself.
+
+    (1.3.1) The update_entity nudge only refreshes core's own Portainer
+    diagnostic sensors (images_count, reclaimable, volume_usage) from
+    Portainer's API -- it says nothing to OUR OWN PortainerCleanupCoordinator,
+    which is what the sidecar's Cleanup tab actually reads, and which
+    otherwise only recomputes on its own 5-minute poll (see
+    PortainerCleanupCoordinator in sensor.py). Without also_refresh, a prune
+    action could nudge the upstream sensors successfully and still leave the
+    Cleanup tab showing a stale, unchanged count for up to 5 minutes --
+    exactly the "button reactivated way before the count updated" report
+    this parameter exists to fix. also_refresh is awaited, so the sidecar's
+    blocking HTTP call doesn't return (and the button re-enable with it)
+    until the tab's own numbers are actually caught up.
+    """
     targets = [e for e in entity_ids if e]
-    if not targets:
-        return
-    await asyncio.sleep(PRUNE_REFRESH_PRE_DELAY_SECONDS)
-    try:
-        await hass.services.async_call(
-            "homeassistant", "update_entity", {"entity_id": targets}, blocking=True
-        )
-    except Exception:
-        _LOGGER.debug("%s: update_entity refresh nudge failed for %s", DOMAIN, targets, exc_info=True)
+    if targets:
+        await asyncio.sleep(PRUNE_REFRESH_PRE_DELAY_SECONDS)
+        try:
+            await hass.services.async_call(
+                "homeassistant", "update_entity", {"entity_id": targets}, blocking=True
+            )
+        except Exception:
+            _LOGGER.debug("%s: update_entity refresh nudge failed for %s", DOMAIN, targets, exc_info=True)
+    if also_refresh is not None:
+        try:
+            await also_refresh.async_request_refresh()
+        except Exception:
+            _LOGGER.debug("%s: coordinator refresh nudge failed", DOMAIN, exc_info=True)
     await asyncio.sleep(PRUNE_REFRESH_POST_DELAY_SECONDS)
 
 
@@ -486,6 +509,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         entity_reg = er.async_get(hass)
         device_reg = dr.async_get(hass)
+        cleanup_coordinator = (
+            hass.data.get(DOMAIN, {}).get(entry.entry_id, {}).get("coordinators", {}).get("cleanup")
+        )
 
         if requested_device_ids:
             root_ids = {
@@ -529,6 +555,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     _endpoint_images_count_entity(entity_reg, root_id),
                     _endpoint_reclaimable_entity(entity_reg, root_id),
                 ],
+                also_refresh=cleanup_coordinator,
             )
 
     if not hass.services.has_service(DOMAIN, SERVICE_PRUNE_IMAGES):
@@ -550,6 +577,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         entity_reg = er.async_get(hass)
         device_reg = dr.async_get(hass)
+        cleanup_coordinator = (
+            hass.data.get(DOMAIN, {}).get(entry.entry_id, {}).get("coordinators", {}).get("cleanup")
+        )
 
         if requested_device_ids:
             root_ids = {
@@ -591,7 +621,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 )
                 continue
 
-            await _refresh_after_action(hass, [_endpoint_volume_usage_entity(entity_reg, root_id)])
+            await _refresh_after_action(
+                hass,
+                [_endpoint_volume_usage_entity(entity_reg, root_id)],
+                also_refresh=cleanup_coordinator,
+            )
 
     if not hass.services.has_service(DOMAIN, SERVICE_PRUNE_VOLUMES):
         hass.services.async_register(
