@@ -469,6 +469,192 @@ async def _verify_github_url(hass: HomeAssistant, url: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# OCI-label discovery -- reads org.opencontainers.image.source straight off
+# the image's own manifest/config, rather than guessing a GitHub path from
+# naming conventions at all.
+#
+# The guess-based methods above (_guess_repo_url_from_path,
+# _fetch_dockerhub_github_url) both assume some naming relationship between
+# the Docker Hub/registry path and the GitHub repo -- exact match, or a
+# link mentioned in the README. Confirmed in production that this breaks
+# down for a monorepo: bdelima/immich-display-integrations publishes TWO
+# differently-named images (bdelima/immich-overflight-feed and
+# bdelima/immich-frame-mirror) from two subfolders of ONE repo whose own
+# name matches neither image -- no naming guess can ever bridge that gap,
+# and a personal project's Docker Hub listing has no README link to scrape
+# either. A hand-maintained override-file entry (see
+# CHANGELOG_OVERRIDES_FILENAME above) papers over one already-known case
+# like this, but doesn't generalize to the next monorepo Bob publishes.
+#
+# The actual fix: read the real answer off the image itself. The
+# local-build-pipeline project skill's OCI-label bootstrap step has every
+# new image Bob builds set org.opencontainers.image.source to its real
+# GitHub repo URL as a build-time LABEL -- standard, well-architected image
+# metadata, not something invented for this integration. Reading it back
+# here means discovery is correct BY CONSTRUCTION for any of Bob's own
+# images going forward, monorepo or not, with zero maintenance -- no
+# override entry, no naming coincidence required. A third-party image that
+# doesn't set this label (most don't, predating the convention) just
+# yields nothing here and falls through to the existing guess/README-scrape
+# methods unchanged.
+#
+# This needs an actual registry API call (manifest + config blob), not
+# just a page fetch -- but it's the SAME anonymous, credential-free access
+# `docker pull` itself gets for any public image; Docker Hub and ghcr.io
+# both require a short-lived anonymous bearer token for this even for
+# public images, obtained from their own token endpoints with no
+# credentials of any kind. Only registries this integration knows the
+# token/manifest endpoints for are attempted (Docker Hub and ghcr.io) --
+# lscr.io (linuxserver.io's own pull-through mirror hostname) and any
+# private/self-hosted registry are skipped here, same as before, falling
+# through to whatever the existing per-host branch already does for them.
+_REGISTRY_MANIFEST_ENDPOINTS: dict[str | None, tuple[str, str, str]] = {
+    # host (as _split_image_repo returns it) -> (registry API base,
+    # anonymous-token URL, that token endpoint's "service" parameter)
+    None: ("https://registry-1.docker.io", "https://auth.docker.io/token", "registry.docker.io"),
+    "docker.io": ("https://registry-1.docker.io", "https://auth.docker.io/token", "registry.docker.io"),
+    "index.docker.io": ("https://registry-1.docker.io", "https://auth.docker.io/token", "registry.docker.io"),
+    "registry-1.docker.io": ("https://registry-1.docker.io", "https://auth.docker.io/token", "registry.docker.io"),
+    "ghcr.io": ("https://ghcr.io", "https://ghcr.io/token", "ghcr.io"),
+}
+
+# A single-platform image manifest carries "config" directly; a multi-arch
+# manifest list/OCI index carries "manifests" (a list of per-platform
+# pointers) instead and needs one more fetch to reach an actual config
+# blob. Distinguishing on mediaType is more reliable than "config" being
+# absent, since a truncated/unexpected response could also lack it.
+_MANIFEST_LIST_MEDIA_TYPES = {
+    "application/vnd.docker.distribution.manifest.list.v2+json",
+    "application/vnd.oci.image.index.v1+json",
+}
+_MANIFEST_ACCEPT_HEADER = ", ".join(
+    [
+        "application/vnd.docker.distribution.manifest.v2+json",
+        "application/vnd.docker.distribution.manifest.list.v2+json",
+        "application/vnd.oci.image.manifest.v1+json",
+        "application/vnd.oci.image.index.v1+json",
+    ]
+)
+
+
+def _extract_reference(image_ref: str) -> str:
+    """The tag or digest portion of an image ref -- distinct from
+    _split_image_repo, which discards this entirely since none of its
+    existing callers needed it before this. Defaults to 'latest' when the
+    ref carries neither, matching what `docker pull` and Portainer itself
+    both default to."""
+    if not image_ref:
+        return "latest"
+    if "@" in image_ref:
+        return image_ref.split("@", 1)[1]  # a digest reference, e.g. "sha256:..."
+    last_segment = image_ref.rsplit("/", 1)[-1]
+    if ":" in last_segment:
+        return last_segment.rsplit(":", 1)[-1]
+    return "latest"
+
+
+async def _registry_anon_token(hass: HomeAssistant, auth_url: str, service: str, repo: str) -> str | None:
+    """The short-lived anonymous bearer token Docker Hub and ghcr.io both
+    require even for reading a PUBLIC image's manifest -- no credentials
+    involved, this is the same token `docker pull` itself fetches
+    silently for an anonymous pull."""
+    session = aiohttp_client.async_get_clientsession(hass)
+    params = {"service": service, "scope": f"repository:{repo}:pull"}
+    try:
+        async with session.get(auth_url, params=params, timeout=aiohttp.ClientTimeout(total=6)) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json(content_type=None)
+    except (aiohttp.ClientError, TimeoutError, ValueError):
+        return None
+    return data.get("token") or data.get("access_token") if isinstance(data, dict) else None
+
+
+async def _fetch_registry_json(
+    hass: HomeAssistant, url: str, token: str | None, accept: str | None = None
+) -> dict | None:
+    """Shared GET-and-parse-JSON helper for both the manifest and config
+    blob fetches below -- same auth header, same error handling, same
+    "missing/broken response just means None" contract as every other
+    discovery helper in this file (a network hiccup here must never break
+    the wider update-checking poll)."""
+    session = aiohttp_client.async_get_clientsession(hass)
+    headers: dict[str, str] = {}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    if accept:
+        headers["Accept"] = accept
+    try:
+        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=6)) as resp:
+            if resp.status != 200:
+                return None
+            return await resp.json(content_type=None)
+    except (aiohttp.ClientError, TimeoutError, ValueError):
+        return None
+
+
+async def _fetch_oci_source_label(hass: HomeAssistant, host: str | None, repo: str, reference: str) -> str | None:
+    """The image's own org.opencontainers.image.source label, read off its
+    manifest/config -- see the module comment above this section for why
+    this exists and what it fixes. Returns None (never raises) for any
+    registry this integration doesn't know how to talk to, any image that
+    doesn't set the label, or any network/parsing hiccup along the way --
+    callers treat that identically to "nothing found," same as the
+    guess/README-scrape methods."""
+    registry_info = _REGISTRY_MANIFEST_ENDPOINTS.get(host)
+    if registry_info is None:
+        return None
+    registry_base, auth_url, service = registry_info
+
+    token = await _registry_anon_token(hass, auth_url, service, repo)
+    manifest = await _fetch_registry_json(
+        hass, f"{registry_base}/v2/{repo}/manifests/{reference}", token, _MANIFEST_ACCEPT_HEADER
+    )
+    if manifest is None and token is not None:
+        # A public image can sometimes be read without a token at all --
+        # worth one more try before giving up entirely.
+        manifest = await _fetch_registry_json(
+            hass, f"{registry_base}/v2/{repo}/manifests/{reference}", None, _MANIFEST_ACCEPT_HEADER
+        )
+    if not isinstance(manifest, dict):
+        return None
+
+    if manifest.get("mediaType") in _MANIFEST_LIST_MEDIA_TYPES or (
+        "manifests" in manifest and "config" not in manifest
+    ):
+        # Multi-arch index -- the label lives on each platform's own
+        # manifest (set from the same Dockerfile LABEL line for every
+        # arch), so any one platform's value is authoritative. Just
+        # resolve the first one listed.
+        entries = manifest.get("manifests") or []
+        if not entries or not isinstance(entries[0], dict):
+            return None
+        child_digest = entries[0].get("digest")
+        if not child_digest:
+            return None
+        manifest = await _fetch_registry_json(
+            hass, f"{registry_base}/v2/{repo}/manifests/{child_digest}", token, _MANIFEST_ACCEPT_HEADER
+        )
+        if not isinstance(manifest, dict):
+            return None
+
+    config_digest = (manifest.get("config") or {}).get("digest") if isinstance(manifest.get("config"), dict) else None
+    if not config_digest:
+        return None
+    config = await _fetch_registry_json(hass, f"{registry_base}/v2/{repo}/blobs/{config_digest}", token)
+    if not isinstance(config, dict):
+        return None
+
+    labels = (config.get("config") or {}).get("Labels") if isinstance(config.get("config"), dict) else None
+    if not isinstance(labels, dict):
+        return None
+    source = labels.get("org.opencontainers.image.source")
+    if isinstance(source, str) and source.startswith("https://github.com/"):
+        return source.rstrip("/")
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Coordinators -- one per sensor, matching the original recompute cadence.
 # ---------------------------------------------------------------------------
 
@@ -519,11 +705,16 @@ class PortainerUpdatesCoordinator(DataUpdateCoordinator[list[dict]]):
         needed -- see that constant's comment for the full story and file
         format; (2) the built-in _KNOWN_CHANGELOG_URLS table, the shipped
         defaults; (3) an auto-discovery attempt (cached after the first
-        try, successful or not). Reads the sibling sensor.<name>_image
-        entity core's portainer integration already creates on the same
-        device -- same "look at what's already on this device" pattern
-        _stack_info uses for a stack's switch entity, just on the
-        container's own device instead of its parent."""
+        try, successful or not), which itself tries the image's own
+        org.opencontainers.image.source label FIRST (see
+        _fetch_oci_source_label's docstring -- the authoritative answer,
+        not a guess, and what actually resolves a monorepo publishing
+        multiple differently-named images) before falling back to the
+        naming-guess/README-scrape methods. Reads the sibling
+        sensor.<name>_image entity core's portainer integration already
+        creates on the same device -- same "look at what's already on this
+        device" pattern _stack_info uses for a stack's switch entity, just
+        on the container's own device instead of its parent."""
         if container_device_id is None:
             return None
         image_entity_id = _container_image_entity_id(self.hass, entity_reg, container_device_id)
@@ -552,7 +743,25 @@ class PortainerUpdatesCoordinator(DataUpdateCoordinator[list[dict]]):
 
         discovered: str | None = None
         try:
-            if host == "ghcr.io":
+            # Try the authoritative source first: the image's own
+            # org.opencontainers.image.source label, if it set one. This is
+            # what actually resolves a monorepo (see _fetch_oci_source_label's
+            # docstring) rather than guessing a GitHub path from naming --
+            # and it costs nothing extra for an image that DOESN'T set the
+            # label, since _fetch_oci_source_label returns None quickly for
+            # a registry/host it doesn't recognize or a manifest with no
+            # such label, falling straight through to the existing
+            # per-host guess logic below unchanged.
+            reference = _extract_reference(image_ref)
+            label_source = await _fetch_oci_source_label(self.hass, host, repo, reference)
+            if label_source:
+                label_releases = f"{label_source}/releases"
+                if await _verify_github_url(self.hass, label_releases):
+                    discovered = label_releases
+
+            if discovered is not None:
+                pass
+            elif host == "ghcr.io":
                 guess = _guess_repo_url_from_path(repo)
                 if guess:
                     # _guess_repo_url_from_path returns the repo's home
