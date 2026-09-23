@@ -590,7 +590,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         # fall back on either way, so it's re-raised immediately, same as
         # before this feature existed.
         switch_entity_id = _stack_switch_entity_id(hass, container_device_id)
-        image_entity_id = _container_image_entity_id(entity_reg, container_device_id)
+        image_entity_id = _container_image_entity_id(hass, entity_reg, container_device_id)
         image_before_state = hass.states.get(image_entity_id) if image_entity_id else None
         image_before = image_before_state.state if image_before_state else None
 

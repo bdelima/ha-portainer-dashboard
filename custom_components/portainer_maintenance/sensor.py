@@ -134,19 +134,77 @@ def _stack_info(
     return stack_name, switch_entity_id
 
 
-def _container_image_entity_id(entity_reg: er.EntityRegistry, container_device_id: str | None) -> str | None:
-    """The sensor.<name>_image entity on a container's own device, if any
-    -- core's portainer integration creates one per container. Shared by
-    the changelog-link lookup below and, in __init__.py, by
-    handle_perform_update's recreate-outcome check -- both need "what
-    image reference is this container on right now," just for different
-    reasons."""
+# Matches both "sensor.<name>_image" and an entity-registry-disambiguated
+# duplicate like "sensor.<name>_image_2" -- see _container_image_entity_id
+# below for why the entity this function needs can end up with either
+# suffix shape.
+_IMAGE_ENTITY_SUFFIX_RE = re.compile(r"_image(_\d+)?$")
+
+
+def _container_image_entity_id(
+    hass: HomeAssistant, entity_reg: er.EntityRegistry, container_device_id: str | None
+) -> str | None:
+    """The sensor.<name>_image entity on a container's own device -- core's
+    portainer integration creates one per container. Shared by the
+    changelog-link lookup below and, in __init__.py, by
+    handle_perform_update's recreate-outcome check -- both need "what image
+    reference is this container on right now," just for different reasons.
+
+    Confirmed in production as the reason changelog discovery silently
+    never ran at all for several of Bob's own containers (topswatch-
+    exporter, qmassa-exporter): HA entity IDs are unique GLOBALLY, not per
+    device. Bob runs the same-named service on more than one host (e.g.
+    topswatch-exporter on both ojochal and naples), so both containers'
+    image sensors want the same object_id (topswatch_exporter_image) --
+    the registry lets whichever was created first keep it and auto-
+    suffixes the other, on a DIFFERENT device, as topswatch_exporter_image_2.
+    This has nothing to do with dangling/leftover images on a single
+    device (an earlier version of this comment guessed that, incorrectly --
+    each affected device here has exactly one, correct, single image
+    entity; it's just sometimes the "_2" one). The original version of
+    this function did a bare entity_id.endswith("_image") scan, which can
+    never match a "_2"-suffixed entity -- so for whichever host lost the
+    naming race, this returned None every time, and _resolve_changelog_url
+    below silently bailed out on its very first guard clause before
+    logging anything at all, which is exactly what made this so hard to
+    spot: zero errors, zero warnings, just nothing happening.
+
+    Fix: match "_image" OR "_image_<N>" when scanning a device's entities.
+    A single device now virtually always yields exactly one candidate
+    regardless of which suffix shape it happened to get. The two-candidate
+    tiebreak below (prefer a live state, then prefer one that looks like a
+    real registry path) is kept as a defensive fallback for the separate,
+    rarer case where a device genuinely does carry more than one image
+    entity of its own (e.g. a real dangling-image leftover on top of the
+    current one) -- it just isn't what explained this particular bug."""
     if container_device_id is None:
         return None
-    for entity in er.async_entries_for_device(entity_reg, container_device_id):
-        if entity.entity_id.startswith("sensor.") and entity.entity_id.endswith("_image"):
-            return entity.entity_id
-    return None
+    candidates = [
+        entity.entity_id
+        for entity in er.async_entries_for_device(entity_reg, container_device_id)
+        if entity.entity_id.startswith("sensor.") and _IMAGE_ENTITY_SUFFIX_RE.search(entity.entity_id)
+    ]
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+
+    def _is_live(entity_id: str) -> bool:
+        state = hass.states.get(entity_id)
+        return state is not None and state.state not in (None, "unavailable", "unknown")
+
+    live_candidates = [c for c in candidates if _is_live(c)]
+    pool = live_candidates or candidates  # all unavailable is still a pool, not nothing
+
+    for entity_id in pool:
+        state = hass.states.get(entity_id)
+        if state and "/" in state.state:
+            return entity_id
+    # Nothing in the pool looked like a registry path (e.g. every live
+    # candidate is a local build tag, or the only one left is an
+    # unnamespaced official image) -- fall back to the first of the pool
+    # rather than returning nothing.
+    return pool[0]
 
 
 # A container's image reference degrading to a bare content digest --
@@ -468,7 +526,7 @@ class PortainerUpdatesCoordinator(DataUpdateCoordinator[list[dict]]):
         container's own device instead of its parent."""
         if container_device_id is None:
             return None
-        image_entity_id = _container_image_entity_id(entity_reg, container_device_id)
+        image_entity_id = _container_image_entity_id(self.hass, entity_reg, container_device_id)
         if image_entity_id is None:
             return None
         state = self.hass.states.get(image_entity_id)
