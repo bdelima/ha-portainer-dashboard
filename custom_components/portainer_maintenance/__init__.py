@@ -563,10 +563,22 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         host_id = _walk_to_root(device_reg, container_device_id)
         host_name = _device_name(device_reg, host_id) or "unknown host"
         state = hass.states.get(update_entity)
-        friendly_name = (
+        # The CONTAINER's own device name, not the update entity's
+        # friendly_name -- core's portainer integration names update.*
+        # entities things like "trawl Image update available", which reads
+        # badly dropped straight into a push notification title ("Update
+        # performed: trawl Image update available (naples)", "Stack
+        # restart needed: trawl Image update available (naples)").
+        # PortainerUpdatesCoordinator._async_update_data in sensor.py
+        # already fixed this exact bug for the dashboard's item list; this
+        # is the same fix for the two native-service push notifications
+        # below, which read this update entity's friendly_name directly
+        # and were never touched by that earlier fix since they're a
+        # completely separate code path.
+        container_name = _device_name(device_reg, container_device_id) or (
             state.attributes.get("friendly_name", update_entity) if state else update_entity
         )
-        device_name = f"{friendly_name} ({host_name})"
+        device_name = f"{container_name} ({host_name})"
 
         # Containers whose network_mode is service:<other>/container:<other>
         # (a VPN sidecar like gluetun) hit a confirmed, unfixed Portainer bug
