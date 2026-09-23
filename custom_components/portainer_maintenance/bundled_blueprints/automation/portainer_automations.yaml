@@ -59,7 +59,7 @@ trigger:
     event: start
   - id: container_trouble
     trigger: state
-    entity_id: sensor.portainer_container_trouble
+    entity_id: sensor.portainer_trouble
   - id: stale_devices
     trigger: state
     entity_id: sensor.portainer_stale_devices
@@ -132,24 +132,15 @@ action:
                     data:
                       tag: "{{ trigger.event.data.action.replace('DISMISS_UPDATE_', '') }}"
 
-      # 4. Handle "Restart Stack Now" -- offered only when perform_update hit
-      #    the confirmed, unfixed Portainer bug where recreating a single
-      #    container on network_mode: service:X/container:X (a VPN sidecar
-      #    like gluetun) fails at the Docker daemon level over a
-      #    hostname/network_mode conflict. The pull+recreate itself still
-      #    completes, but the image tag only reconciles once the owning
-      #    stack is restarted -- see __init__.py's module docstring (1c.)
-      #    for the full story. Deliberately a tap, not automatic: a stack
-      #    restart bounces every other container in it too.
-      - conditions:
-          - condition: trigger
-            id: notification_action
-          - condition: template
-            value_template: "{{ trigger.event.data.action.startswith('RESTART_STACK_') }}"
-        sequence:
-          - action: portainer_maintenance.restart_stack
-            data:
-              switch_entity_id: "{{ trigger.event.data.action.replace('RESTART_STACK_', '') }}"
+      # 4. (removed in 1.3.0) Used to handle a "Restart Stack Now" action
+      #    baked directly into the stack-restart-needed push. That
+      #    remediation now lives only on the dashboard's Trouble tab (a
+      #    stack can have several independent per-container update
+      #    notifications in flight at once, and a one-tap restart in any
+      #    one of them made that workflow feel disconnected from the
+      #    others) -- portainer_maintenance.restart_stack is still a plain
+      #    service, callable directly from the webapp or Developer Tools,
+      #    it's just no longer wired to a notification action here.
 
       # 5. Startup recheck for missed updates
       - conditions:
@@ -192,7 +183,11 @@ action:
                       clickAction: "{{ states('sensor.portainer_actions_url') }}"
                       url: "{{ states('sensor.portainer_actions_url') }}"
 
-      # 6. Notify on container trouble
+      # 6. Notify on trouble -- (1.3.0) sensor.portainer_trouble broadened
+      #    past individual containers to also cover an endpoint that's
+      #    dropped its connection entirely and a container stuck on the
+      #    known network_mode:service:X daemon conflict, so this wording
+      #    stays generic rather than naming "container" specifically.
       - conditions:
           - condition: trigger
             id: container_trouble
@@ -205,16 +200,16 @@ action:
               sequence:
                 - action: "{{ repeat.item }}"
                   data:
-                    title: "Container trouble"
+                    title: "Portainer trouble"
                     message: >
-                      {{ trigger.to_state.state }} container{{ 's' if trigger.to_state.state | int != 1 else '' }} need attention. Tap to review.
+                      {{ trigger.to_state.state }} item{{ 's' if trigger.to_state.state | int != 1 else '' }} need attention. Tap to review.
                     data:
-                      tag: "portainer_container_trouble"
+                      tag: "portainer_trouble"
                       priority: high
                       ttl: 0
                       channel: alarm_stream
-                      clickAction: "{{ states('sensor.portainer_actions_url') }}"
-                      url: "{{ states('sensor.portainer_actions_url') }}"
+                      clickAction: "{{ states('sensor.portainer_actions_url') }}#trouble"
+                      url: "{{ states('sensor.portainer_actions_url') }}#trouble"
 
       # 7. Report stale Portainer devices
       - conditions:
@@ -271,8 +266,9 @@ action:
   - variables:
       total_action_items: >-
         {{ (states('sensor.portainer_updates_pending') | int(0))
-           + (states('sensor.portainer_container_trouble') | int(0))
-           + (states('sensor.portainer_stale_devices') | int(0)) }}
+           + (states('sensor.portainer_trouble') | int(0))
+           + (states('sensor.portainer_stale_devices') | int(0))
+           + (states('sensor.portainer_cleanup') | int(0)) }}
   - if:
       - condition: template
         value_template: "{{ total_action_items > 0 }}"
@@ -284,11 +280,13 @@ action:
           message: |-
             {%- set updates_n = states('sensor.portainer_updates_pending') | int(0) -%}
             {%- set stale_n = states('sensor.portainer_stale_devices') | int(0) -%}
-            {%- set trouble_n = states('sensor.portainer_container_trouble') | int(0) -%}
+            {%- set trouble_n = states('sensor.portainer_trouble') | int(0) -%}
+            {%- set cleanup_n = states('sensor.portainer_cleanup') | int(0) -%}
             {%- set parts = [] -%}
             {%- if updates_n > 0 -%}{%- set parts = parts + [updates_n ~ ' image update' ~ ('s' if updates_n != 1 else '')] -%}{%- endif -%}
+            {%- if trouble_n > 0 -%}{%- set parts = parts + [trouble_n ~ ' item' ~ ('s' if trouble_n != 1 else '') ~ ' in trouble'] -%}{%- endif -%}
             {%- if stale_n > 0 -%}{%- set parts = parts + [stale_n ~ ' stale device' ~ ('s' if stale_n != 1 else '')] -%}{%- endif -%}
-            {%- if trouble_n > 0 -%}{%- set parts = parts + [trouble_n ~ ' container' ~ ('s' if trouble_n != 1 else '') ~ ' in trouble'] -%}{%- endif -%}
+            {%- if cleanup_n > 0 -%}{%- set parts = parts + [cleanup_n ~ ' image' ~ ('s' if cleanup_n != 1 else '') ~ ' to clean up'] -%}{%- endif -%}
             {%- set summary = parts[0] if parts | length == 1 else (parts[0] ~ ' and ' ~ parts[1]) if parts | length == 2 else (parts[:-1] | join(', ') ~ ', and ' ~ parts[-1]) -%}
             Portainer is reporting {{ summary }}. [Open dashboard](/portainer-actions) to review.
     else:

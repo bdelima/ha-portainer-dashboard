@@ -1,26 +1,21 @@
 """Tracking sensors for Portainer Maintenance.
 
-Native replacements for the three trigger-based template sensors that used
-to live in templates.yaml (sensor.portainer_updates_pending,
-sensor.portainer_container_trouble, sensor.portainer_stale_devices), plus a
-new read-only sensor.portainer_actions_url. These moved here specifically
-because trigger-based template sensors with a shared `variables:` block
-have no Helpers UI editor at all -- as native integration entities, that
-constraint disappears entirely.
+Native replacements for the trigger-based template sensors that used to
+live in templates.yaml, plus a read-only sensor.portainer_actions_url.
+These moved here specifically because trigger-based template sensors with
+a shared `variables:` block have no Helpers UI editor at all -- as native
+integration entities, that constraint disappears entirely.
 
-Each of the three list sensors ports its original Jinja logic into plain
-Python against the device/entity registries directly (the same registries
-`device_attr()`, `config_entry_attr()`, `device_id()` etc. read from under
-the hood in templates) rather than executor-offloaded work, since none of
-this touches disk or the network -- registry/state reads are fine directly
-on the event loop, same as template rendering itself.
+Each list sensor ports its original Jinja logic into plain Python against
+the device/entity registries directly (the same registries `device_attr()`,
+`config_entry_attr()`, `device_id()` etc. read from under the hood in
+templates) rather than executor-offloaded work, since none of this touches
+disk or the network -- registry/state reads are fine directly on the event
+loop, same as template rendering itself.
 
-Entity_ids are pinned explicitly (self.entity_id set before add) to the
-exact values templates.yaml used to produce, so the merged automation
-blueprint and the webapp's REST calls don't need to change. This only
-lands cleanly if the old templates.yaml-based sensors are removed BEFORE
-this integration's sensors are set up -- otherwise HA's registry will
-auto-suffix these as _2 to avoid colliding with the old ones.
+Entity_ids are pinned explicitly (self.entity_id set before add) so the
+merged automation blueprint and the webapp's REST calls don't need to
+change across releases that only add sensors.
 """
 from __future__ import annotations
 
@@ -44,8 +39,9 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity, DataUpda
 from .const import (
     DOMAIN,
     SENSOR_ACTIONS_URL,
-    SENSOR_CONTAINER_TROUBLE,
+    SENSOR_CLEANUP,
     SENSOR_STALE_DEVICES,
+    SENSOR_TROUBLE,
     SENSOR_UPDATES_PENDING,
 )
 
@@ -98,20 +94,19 @@ def _stack_info(
     """(stack_name, stack_switch_entity_id) for a container device, or
     (None, None) if it isn't part of a stack.
 
-    The device hierarchy is Endpoint -> Stack -> Container (confirmed via
-    HA's own device list, not assumed): a container's immediate parent
-    (via_device_id) is its stack. But a *standalone* container (deployed
-    outside Compose) is parented directly to the Endpoint instead, with no
-    Stack device in between -- so the immediate parent alone doesn't tell
-    us which case we're in. The distinguishing check: a real Stack device
-    has its own via_device_id pointing further up to the Endpoint, while
-    the Endpoint itself has none (same root-detection trick used
-    elsewhere in this file). If the immediate parent has no further
-    parent, it IS the Endpoint, and this container has no stack.
+    The device hierarchy is Endpoint -> Stack -> Container: a container's
+    immediate parent (via_device_id) is its stack. But a *standalone*
+    container (deployed outside Compose) is parented directly to the
+    Endpoint instead, with no Stack device in between -- so the immediate
+    parent alone doesn't tell us which case we're in. The distinguishing
+    check: a real Stack device has its own via_device_id pointing further
+    up to the Endpoint, while the Endpoint itself has none. If the
+    immediate parent has no further parent, it IS the Endpoint, and this
+    container has no stack.
 
-    Used both by the updates-pending sensor (to group the dashboard's
-    tree view) and by __init__.py's perform_update (to find the switch.*
-    entity to offer restarting when a recreate hits the known
+    Used by the updates-pending sensor (dashboard tree grouping), the
+    trouble sensor (stack-restart remediation target), and __init__.py's
+    perform_update (to find the switch.* entity to restart on the known
     network_mode:service:X daemon-conflict bug)."""
     if container_device_id is None:
         return None, None
@@ -134,11 +129,25 @@ def _stack_info(
     return stack_name, switch_entity_id
 
 
+def _stack_device_id(device_reg: dr.DeviceRegistry, container_device_id: str | None) -> str | None:
+    """The container's owning Stack device_id, or None if standalone. Thin
+    counterpart to _stack_info for callers that need the device_id itself
+    (tree grouping) rather than its name/switch entity."""
+    if container_device_id is None:
+        return None
+    container_device = device_reg.async_get(container_device_id)
+    if container_device is None or container_device.via_device_id is None:
+        return None
+    parent = device_reg.async_get(container_device.via_device_id)
+    if parent is None or parent.via_device_id is None:
+        return None
+    return container_device.via_device_id
+
+
 # Matches both "sensor.<name>_image" and an entity-registry-disambiguated
-# duplicate like "sensor.<name>_image_2" -- see _container_image_entity_id
-# below for why the entity this function needs can end up with either
-# suffix shape.
+# duplicate like "sensor.<name>_image_2".
 _IMAGE_ENTITY_SUFFIX_RE = re.compile(r"_image(_\d+)?$")
+_STATE_ENTITY_SUFFIX_RE = re.compile(r"_state(_\d+)?$")
 
 
 def _container_image_entity_id(
@@ -146,37 +155,16 @@ def _container_image_entity_id(
 ) -> str | None:
     """The sensor.<name>_image entity on a container's own device -- core's
     portainer integration creates one per container. Shared by the
-    changelog-link lookup below and, in __init__.py, by
-    handle_perform_update's recreate-outcome check -- both need "what image
-    reference is this container on right now," just for different reasons.
+    changelog-link lookup below, __init__.py's handle_perform_update
+    recreate-outcome check, and this file's own stuck-container scan for
+    the Trouble sensor -- all three need "what image reference is this
+    container on right now," just for different reasons.
 
-    Confirmed in production as the reason changelog discovery silently
-    never ran at all for several of Bob's own containers (topswatch-
-    exporter, qmassa-exporter): HA entity IDs are unique GLOBALLY, not per
-    device. Bob runs the same-named service on more than one host (e.g.
-    topswatch-exporter on both ojochal and naples), so both containers'
-    image sensors want the same object_id (topswatch_exporter_image) --
-    the registry lets whichever was created first keep it and auto-
-    suffixes the other, on a DIFFERENT device, as topswatch_exporter_image_2.
-    This has nothing to do with dangling/leftover images on a single
-    device (an earlier version of this comment guessed that, incorrectly --
-    each affected device here has exactly one, correct, single image
-    entity; it's just sometimes the "_2" one). The original version of
-    this function did a bare entity_id.endswith("_image") scan, which can
-    never match a "_2"-suffixed entity -- so for whichever host lost the
-    naming race, this returned None every time, and _resolve_changelog_url
-    below silently bailed out on its very first guard clause before
-    logging anything at all, which is exactly what made this so hard to
-    spot: zero errors, zero warnings, just nothing happening.
-
-    Fix: match "_image" OR "_image_<N>" when scanning a device's entities.
-    A single device now virtually always yields exactly one candidate
-    regardless of which suffix shape it happened to get. The two-candidate
-    tiebreak below (prefer a live state, then prefer one that looks like a
-    real registry path) is kept as a defensive fallback for the separate,
-    rarer case where a device genuinely does carry more than one image
-    entity of its own (e.g. a real dangling-image leftover on top of the
-    current one) -- it just isn't what explained this particular bug."""
+    HA entity IDs are unique GLOBALLY, not per device -- running the same-
+    named service on more than one host means both containers' image
+    sensors want the same object_id, and the registry auto-suffixes the
+    second one (`..._image_2`). Matches either suffix shape so whichever
+    host lost that naming race is still found."""
     if container_device_id is None:
         return None
     candidates = [
@@ -200,11 +188,31 @@ def _container_image_entity_id(
         state = hass.states.get(entity_id)
         if state and "/" in state.state:
             return entity_id
-    # Nothing in the pool looked like a registry path (e.g. every live
-    # candidate is a local build tag, or the only one left is an
-    # unnamespaced official image) -- fall back to the first of the pool
-    # rather than returning nothing.
     return pool[0]
+
+
+def _container_state_entity_id(entity_reg: er.EntityRegistry, container_device_id: str | None) -> str | None:
+    """The sensor.<name>_state entity on a container's own device -- core's
+    diagnostic ENUM sensor reporting the raw Docker container state
+    (running/exited/dead/paused/restarting/created/removing). Same
+    dual-suffix matching as _container_image_entity_id, for the same
+    reason (global entity_id uniqueness across hosts)."""
+    if container_device_id is None:
+        return None
+    candidates = [
+        entity.entity_id
+        for entity in er.async_entries_for_device(entity_reg, container_device_id)
+        if entity.entity_id.startswith("sensor.") and _STATE_ENTITY_SUFFIX_RE.search(entity.entity_id)
+    ]
+    return candidates[0] if candidates else None
+
+
+def _container_is_running(hass: HomeAssistant, entity_reg: er.EntityRegistry, container_device_id: str | None) -> bool:
+    entity_id = _container_state_entity_id(entity_reg, container_device_id)
+    if entity_id is None:
+        return False
+    state = hass.states.get(entity_id)
+    return state is not None and state.state == "running"
 
 
 # A container's image reference degrading to a bare content digest --
@@ -223,90 +231,182 @@ def _looks_like_bare_digest(image_ref: str | None) -> bool:
     return bool(_BARE_DIGEST_RE.match(image_ref.strip()))
 
 
+def _find_stuck_containers(
+    hass: HomeAssistant, entity_reg: er.EntityRegistry, device_reg: dr.DeviceRegistry
+) -> list[dict]:
+    """Every container currently showing the network_mode:service:X
+    daemon-conflict symptom: its own image entity has degraded to a bare
+    digest, AND the container is actually running (rules out a container
+    that's merely mid-recreate or stopped for an unrelated reason, which
+    could otherwise transiently read oddly here).
+
+    Deliberately stateless -- both conditions are re-derived fresh from
+    live entity state on every call, nothing cached or remembered between
+    polls. That means it needs no persisted flag to survive an HA/
+    integration restart (the very next poll after restart sees the same
+    live state and reaches the same answer), and it clears itself the
+    moment the image entity reflects a normal tag again -- no separate
+    "auto-clear" logic, no dismiss control, just the same check re-run.
+
+    Used by PortainerTroubleCoordinator (to report the item) and
+    PortainerUpdatesCoordinator (to badge the owning stack's row) -- one
+    shared detection, not two that could drift."""
+    portainer_ids = _portainer_entity_ids(entity_reg)
+    image_entities = [
+        e for e in portainer_ids if e.startswith("sensor.") and _IMAGE_ENTITY_SUFFIX_RE.search(e)
+    ]
+    stuck: list[dict] = []
+    for image_entity_id in image_entities:
+        state = hass.states.get(image_entity_id)
+        if state is None or not _looks_like_bare_digest(state.state):
+            continue
+        reg_entry = entity_reg.async_get(image_entity_id)
+        device_id = reg_entry.device_id if reg_entry else None
+        if device_id is None or not _container_is_running(hass, entity_reg, device_id):
+            continue
+
+        host_id = _walk_to_root(device_reg, device_id)
+        host = _device_name(device_reg, host_id) or "unknown host"
+        container_name = _device_name(device_reg, device_id) or device_id
+        stack_name, switch_entity_id = _stack_info(device_reg, entity_reg, device_id)
+        stack_dev_id = _stack_device_id(device_reg, device_id)
+
+        stuck.append(
+            {
+                "device_id": device_id,
+                "container_name": container_name,
+                "host": host,
+                "host_device_id": host_id,
+                "stack_name": stack_name,
+                "stack_device_id": stack_dev_id,
+                "switch_entity_id": switch_entity_id,
+            }
+        )
+    return stuck
+
+
+def _stacks_with_open_trouble(hass: HomeAssistant, entity_reg: er.EntityRegistry, device_reg: dr.DeviceRegistry) -> set[str]:
+    """Stack device_ids that currently have a stuck container under them --
+    used by PortainerUpdatesCoordinator to badge that stack's row, so
+    "other pending updates for this stack" don't get installed blind while
+    a restart is still owed. Calls the same _find_stuck_containers as the
+    Trouble sensor itself rather than a separate check."""
+    return {
+        item["stack_device_id"]
+        for item in _find_stuck_containers(hass, entity_reg, device_reg)
+        if item["stack_device_id"]
+    }
+
+
+# ---------------------------------------------------------------------------
+# Endpoint helpers -- shared by the broadened Trouble sensor (endpoint
+# dropped connection) and the new Cleanup sensor (per-endpoint counts).
+# ---------------------------------------------------------------------------
+
+def _discover_endpoint_devices(entity_reg: er.EntityRegistry, device_reg: dr.DeviceRegistry) -> set[str]:
+    """Every root Endpoint device_id this HA instance knows about, found by
+    walking every portainer-platform entity up to its root -- the same
+    dynamic discovery __init__.py's prune_images already uses, so a newly
+    added host is picked up automatically here too."""
+    roots: set[str] = set()
+    for entity_id in _portainer_entity_ids(entity_reg):
+        reg_entry = entity_reg.async_get(entity_id)
+        device_id = reg_entry.device_id if reg_entry else None
+        root_id = _walk_to_root(device_reg, device_id)
+        if root_id:
+            roots.add(root_id)
+    return roots
+
+
+def _endpoint_unavailable_since(
+    hass: HomeAssistant, entity_reg: er.EntityRegistry, endpoint_device_id: str
+) -> datetime | None:
+    """None if the endpoint's OWN entities (not a child container's) are
+    available; otherwise the earliest last_changed among them, i.e. how
+    long it's been down. Core's portainer integration drops an endpoint
+    from its coordinator data the moment it can't reach it -- every entity
+    on that device (and everything under it) goes `unavailable` with no
+    dedicated "endpoint unreachable" signal of its own, which is exactly
+    the gap this closes."""
+    own_entities = [e.entity_id for e in er.async_entries_for_device(entity_reg, endpoint_device_id)]
+    if not own_entities:
+        return None
+    states = [hass.states.get(e) for e in own_entities]
+    if any(s is None for s in states):
+        return None
+    if not all(s.state == "unavailable" for s in states):
+        return None
+    return min(s.last_changed for s in states)
+
+
+def _device_entity_by_suffix(entity_reg: er.EntityRegistry, device_id: str, domain_prefix: str, suffixes: tuple[str, ...]) -> str | None:
+    """First entity on a device whose entity_id starts with domain_prefix
+    (e.g. "sensor." or "button.") and ends with one of the given suffixes.
+    Suffix-matching, same pragmatic approach _container_image_entity_id
+    and _container_state_entity_id already use, since object_ids can shift
+    slightly across pyportainer/core releases (e.g. "_images_count" vs
+    "_image_count") -- worth confirming the exact suffix against a live
+    instance if a Cleanup badge ever reads consistently empty."""
+    for entity in er.async_entries_for_device(entity_reg, device_id):
+        if not entity.entity_id.startswith(domain_prefix):
+            continue
+        for suffix in suffixes:
+            if entity.entity_id.endswith(suffix):
+                return entity.entity_id
+    return None
+
+
+def _endpoint_images_count_entity(entity_reg: er.EntityRegistry, device_id: str) -> str | None:
+    return _device_entity_by_suffix(entity_reg, device_id, "sensor.", ("_images_count", "_image_count"))
+
+
+def _endpoint_containers_count_entity(entity_reg: er.EntityRegistry, device_id: str) -> str | None:
+    return _device_entity_by_suffix(entity_reg, device_id, "sensor.", ("_containers_count", "_container_count"))
+
+
+def _endpoint_reclaimable_entity(entity_reg: er.EntityRegistry, device_id: str) -> str | None:
+    return _device_entity_by_suffix(entity_reg, device_id, "sensor.", ("_image_disk_usage_reclaimable",))
+
+
+def _endpoint_volume_usage_entity(entity_reg: er.EntityRegistry, device_id: str) -> str | None:
+    return _device_entity_by_suffix(entity_reg, device_id, "sensor.", ("_volume_disk_usage_total",))
+
+
+def _endpoint_volumes_prune_button(entity_reg: er.EntityRegistry, device_id: str) -> str | None:
+    return _device_entity_by_suffix(entity_reg, device_id, "button.", ("_volumes_prune",))
+
+
+def _numeric_state(hass: HomeAssistant, entity_id: str | None) -> float | None:
+    """A sensor's numeric value, or None for missing/unknown/unavailable --
+    disk-usage sensors (backed by a separate coordinator from the main
+    endpoint data) have been observed inconsistently `unknown` on some
+    hosts, so every caller of this must treat None as "no number to show,"
+    never math on it or format it as 0."""
+    if entity_id is None:
+        return None
+    state = hass.states.get(entity_id)
+    if state is None or state.state in (None, "unknown", "unavailable"):
+        return None
+    try:
+        return float(state.state)
+    except (TypeError, ValueError):
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Changelog links -- a hand-curated override table, backed by automatic
 # discovery for anything not in it.
-#
-# The core portainer integration's update.* entities carry no changelog
-# data at all (confirmed: they're pure digest comparisons -- installed/
-# latest_version are raw SHA256 hashes, not semantic tags, and neither
-# release_summary nor release_url is ever set). Reading it from the
-# image's own OCI labels (org.opencontainers.image.source) was considered
-# and rejected: it needs its own Portainer API credentials (a new,
-# separate setup field this integration doesn't otherwise require), and
-# even then, coverage is inconsistent -- confirmed present on some
-# GHCR/GitHub-Actions-built images (e.g. gluetun), confirmed ABSENT on
-# linuxserver.io images (a large share of a typical homelab), which set
-# only build_version/maintainer labels, no OCI annotations at all.
-#
-# Instead of reading labels, discovery reads the same two public places a
-# web search on an image tag tends to surface a GitHub link from -- just
-# directly, without going through a search engine (which would mean
-# scraping search-result HTML with no sanctioned API, and realistically
-# getting rate-limited/CAPTCHA'd by a home server hitting it repeatedly):
-#   - ghcr.io images: the image path *is* a GitHub owner/repo path, so the
-#     URL is a direct guess (verified with a live request before use, not
-#     assumed correct).
-#   - Docker Hub images (this is what covers LSIO): Docker Hub's own public
-#     repository API returns the README text, which conventionally links
-#     back to the upstream GitHub repo; the first plausible match is
-#     extracted and, again, verified live before use.
-# Both lookups happen at most once per distinct image repo path -- the
-# result (including "nothing found") is cached on the coordinator for the
-# life of the integration, so this never runs on every 5-minute poll, only
-# the first time a given image is seen with a pending update.
-#
-# The table below is an override, checked first and always wins over
-# whatever discovery would find -- useful when an image's Docker
-# Hub/registry path doesn't match its real upstream repo (Home Assistant's
-# own image is kept here for exactly that reason) or when discovery simply
-# can't reach a conclusion (a private/self-hosted registry, or a Docker
-# Hub README with no usable link). Nothing needs to be added here anymore
-# for the common case -- add an entry only to correct or guarantee a
-# specific mapping.
-#
-# Keys are the image reference's repository path ONLY -- no registry
-# host, no tag, no digest (see _split_image_repo). A few projects publish
-# multiple image variants (different base OS/arch) under different repo
-# paths for the same upstream project; add one entry per variant actually
-# in use rather than trying to pattern-match them.
-#
-# Plex is deliberately not here, and discovery will never find it either:
-# Plex Media Server is closed-source, so there is no public GitHub
-# releases page to link to at all -- not a gap in this table or in
-# discovery, an inherent limit of the upstream project.
+# ---------------------------------------------------------------------------
 _KNOWN_CHANGELOG_URLS: dict[str, str] = {
     "homeassistant/home-assistant": "https://github.com/home-assistant/core/releases",
     "qmcgaw/gluetun": "https://github.com/qdm12/gluetun/releases",
     "portainer/portainer-ce": "https://github.com/portainer/portainer/releases",
 }
 
-# A runtime, no-rebuild-required override file, checked BEFORE
-# _KNOWN_CHANGELOG_URLS above -- editing that dict means shipping a new
-# integration release just to add or fix one URL. This file lives in HA's
-# own config directory (next to configuration.yaml -- resolved via
-# hass.config.path so it's correct on any install, not hardcoded to one of
-# Bob's hosts), survives every integration update/reinstall since it's
-# outside custom_components/ entirely, and is re-read on every resolution
-# attempt for an unmapped repo (see _load_changelog_overrides below) -- so
-# an edit takes effect on the next 5-minute poll, no HA restart needed.
-# Same key format as _KNOWN_CHANGELOG_URLS: the image's repo path only, no
-# registry host/tag/digest. On a key collision between this file and
-# _KNOWN_CHANGELOG_URLS, this file always wins -- it's the override
-# mechanism, the built-in table is just the shipped defaults underneath it.
 CHANGELOG_OVERRIDES_FILENAME = "portainer_maintenance_changelog_overrides.json"
 
 
 def _load_changelog_overrides_sync(path: str) -> dict[str, str]:
-    """Blocking file read -- never call this directly from a coroutine;
-    always go through _load_changelog_overrides, which offloads it to HA's
-    executor (recent HA versions warn/error on blocking I/O straight on the
-    event loop). A missing file is the normal, common case (nobody's added
-    an override yet) and logged at debug only; a present-but-malformed file
-    is logged at warning, since that's a typo Bob would want to know about,
-    and either way this returns an empty dict rather than raising -- a bad
-    override file must never break changelog resolution for every other
-    container."""
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
@@ -339,18 +439,10 @@ def _load_changelog_overrides_sync(path: str) -> dict[str, str]:
 
 
 async def _load_changelog_overrides(hass: HomeAssistant) -> dict[str, str]:
-    """See CHANGELOG_OVERRIDES_FILENAME above for the precedence/reload
-    story. Cheap enough (a small local JSON file, read at most once per
-    unmapped repo per 5-minute poll) that no additional caching is needed
-    here beyond PortainerUpdatesCoordinator's existing _changelog_cache,
-    which this sits in front of."""
     path = hass.config.path(CHANGELOG_OVERRIDES_FILENAME)
     return await hass.async_add_executor_job(_load_changelog_overrides_sync, path)
 
 
-# Docker Hub README links that are never the project's own repo -- GitHub
-# path segments that happen to look like an "owner" but are actually a
-# platform feature.
 _GITHUB_NON_REPO_OWNERS = {
     "sponsors", "apps", "marketplace", "orgs", "settings", "about",
     "features", "pricing", "topics", "collections", "trending", "explore",
@@ -362,14 +454,6 @@ _GITHUB_URL_RE = re.compile(
 
 
 def _split_image_repo(image_ref: str) -> tuple[str | None, str | None]:
-    """'lscr.io/linuxserver/plex:1.32.5' -> ('lscr.io', 'linuxserver/plex').
-    Strips a digest (@sha256:...), a tag (:latest), and a leading registry
-    host (anything before the first '/' that looks like a host -- contains
-    a '.' or ':', or is exactly 'localhost' -- since a bare Docker Hub
-    image has no host segment at all, e.g. 'homeassistant/home-assistant'
-    with no leading docker.io/). host is None when the ref has no explicit
-    registry host (i.e. it's Docker Hub). Returns (None, None) for an
-    empty/unparseable ref."""
     if not image_ref:
         return None, None
     ref = image_ref.split("@", 1)[0]  # drop a digest, if present
@@ -381,35 +465,13 @@ def _split_image_repo(image_ref: str) -> tuple[str | None, str | None]:
         parts = parts[1:]  # drop the registry host segment
     ref = "/".join(parts)
 
-    # Drop a trailing :tag -- but only the last segment's ':', since a
-    # registry host earlier in the ref (already stripped above, but just
-    # in case) could itself contain one.
     if ":" in ref.rsplit("/", 1)[-1]:
         ref = ref.rsplit(":", 1)[0]
 
     return host, (ref or None)
 
 
-def _normalize_image_repo(image_ref: str) -> str | None:
-    """Repo-path-only convenience wrapper around _split_image_repo, kept
-    for callers that only care about the table-lookup key."""
-    return _split_image_repo(image_ref)[1]
-
-
 def _guess_repo_url_from_path(repo: str) -> str | None:
-    """A ghcr.io image path IS a GitHub owner/repo path -- e.g.
-    ghcr.io/immich-app/immich-server maps to github.com/immich-app/immich-server.
-    This isn't ghcr.io-specific, though: it's also exactly right for any
-    project (Bob's own images included -- same username on GitHub and
-    Docker Hub, same repo name in both places) that publishes to Docker Hub
-    under a namespace/repo pair matching its GitHub owner/repo exactly, so
-    the Docker Hub/lscr.io branch below tries this same guess first, before
-    falling back to README-scraping. This is a guess, not a certainty (a
-    project can publish an image under a path segment that isn't its exact
-    repo name -- linuxserver.io's repos are named 'docker-<app>', not
-    '<app>', which is exactly the case the README-scrape fallback exists
-    for), which is why the caller always verifies it with a live request
-    before trusting it."""
     parts = repo.split("/")
     if len(parts) < 2:
         return None
@@ -417,9 +479,6 @@ def _guess_repo_url_from_path(repo: str) -> str | None:
 
 
 def _first_github_repo_url(text: str) -> str | None:
-    """Pull the first plausible github.com/<owner>/<repo> URL out of free
-    text (a Docker Hub README), skipping GitHub path segments that are
-    platform features rather than a user/org (github.com/sponsors/...)."""
     if not text:
         return None
     for match in _GITHUB_URL_RE.finditer(text):
@@ -434,12 +493,6 @@ def _first_github_repo_url(text: str) -> str | None:
 
 
 async def _fetch_dockerhub_github_url(hass: HomeAssistant, repo: str) -> str | None:
-    """Reads the repo's public Docker Hub page data (no auth needed for a
-    public repo) and extracts a GitHub link from its README text, the same
-    text a web search on the image tag tends to surface a GitHub result
-    from in the first place -- just read directly instead of through a
-    search engine. 'redis' (a Docker Official Image, no namespace) lives
-    under the 'library' namespace on Docker Hub's API."""
     parts = repo.split("/")
     namespace, name = ("library", parts[0]) if len(parts) == 1 else (parts[0], parts[1])
     session = aiohttp_client.async_get_clientsession(hass)
@@ -456,10 +509,6 @@ async def _fetch_dockerhub_github_url(hass: HomeAssistant, repo: str) -> str | N
 
 
 async def _verify_github_url(hass: HomeAssistant, url: str) -> bool:
-    """A guessed/scraped URL is only trusted once it's confirmed live --
-    this is what turns "probably right" into "actually resolves right
-    now", at the cost of one HTTPS round trip, done once per repo and
-    cached after that (see PortainerUpdatesCoordinator._changelog_cache)."""
     session = aiohttp_client.async_get_clientsession(hass)
     try:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=5), allow_redirects=True) as resp:
@@ -468,49 +517,7 @@ async def _verify_github_url(hass: HomeAssistant, url: str) -> bool:
         return False
 
 
-# ---------------------------------------------------------------------------
-# OCI-label discovery -- reads org.opencontainers.image.source straight off
-# the image's own manifest/config, rather than guessing a GitHub path from
-# naming conventions at all.
-#
-# The guess-based methods above (_guess_repo_url_from_path,
-# _fetch_dockerhub_github_url) both assume some naming relationship between
-# the Docker Hub/registry path and the GitHub repo -- exact match, or a
-# link mentioned in the README. Confirmed in production that this breaks
-# down for a monorepo: bdelima/immich-display-integrations publishes TWO
-# differently-named images (bdelima/immich-overflight-feed and
-# bdelima/immich-frame-mirror) from two subfolders of ONE repo whose own
-# name matches neither image -- no naming guess can ever bridge that gap,
-# and a personal project's Docker Hub listing has no README link to scrape
-# either. A hand-maintained override-file entry (see
-# CHANGELOG_OVERRIDES_FILENAME above) papers over one already-known case
-# like this, but doesn't generalize to the next monorepo Bob publishes.
-#
-# The actual fix: read the real answer off the image itself. The
-# local-build-pipeline project skill's OCI-label bootstrap step has every
-# new image Bob builds set org.opencontainers.image.source to its real
-# GitHub repo URL as a build-time LABEL -- standard, well-architected image
-# metadata, not something invented for this integration. Reading it back
-# here means discovery is correct BY CONSTRUCTION for any of Bob's own
-# images going forward, monorepo or not, with zero maintenance -- no
-# override entry, no naming coincidence required. A third-party image that
-# doesn't set this label (most don't, predating the convention) just
-# yields nothing here and falls through to the existing guess/README-scrape
-# methods unchanged.
-#
-# This needs an actual registry API call (manifest + config blob), not
-# just a page fetch -- but it's the SAME anonymous, credential-free access
-# `docker pull` itself gets for any public image; Docker Hub and ghcr.io
-# both require a short-lived anonymous bearer token for this even for
-# public images, obtained from their own token endpoints with no
-# credentials of any kind. Only registries this integration knows the
-# token/manifest endpoints for are attempted (Docker Hub and ghcr.io) --
-# lscr.io (linuxserver.io's own pull-through mirror hostname) and any
-# private/self-hosted registry are skipped here, same as before, falling
-# through to whatever the existing per-host branch already does for them.
 _REGISTRY_MANIFEST_ENDPOINTS: dict[str | None, tuple[str, str, str]] = {
-    # host (as _split_image_repo returns it) -> (registry API base,
-    # anonymous-token URL, that token endpoint's "service" parameter)
     None: ("https://registry-1.docker.io", "https://auth.docker.io/token", "registry.docker.io"),
     "docker.io": ("https://registry-1.docker.io", "https://auth.docker.io/token", "registry.docker.io"),
     "index.docker.io": ("https://registry-1.docker.io", "https://auth.docker.io/token", "registry.docker.io"),
@@ -518,11 +525,6 @@ _REGISTRY_MANIFEST_ENDPOINTS: dict[str | None, tuple[str, str, str]] = {
     "ghcr.io": ("https://ghcr.io", "https://ghcr.io/token", "ghcr.io"),
 }
 
-# A single-platform image manifest carries "config" directly; a multi-arch
-# manifest list/OCI index carries "manifests" (a list of per-platform
-# pointers) instead and needs one more fetch to reach an actual config
-# blob. Distinguishing on mediaType is more reliable than "config" being
-# absent, since a truncated/unexpected response could also lack it.
 _MANIFEST_LIST_MEDIA_TYPES = {
     "application/vnd.docker.distribution.manifest.list.v2+json",
     "application/vnd.oci.image.index.v1+json",
@@ -538,15 +540,10 @@ _MANIFEST_ACCEPT_HEADER = ", ".join(
 
 
 def _extract_reference(image_ref: str) -> str:
-    """The tag or digest portion of an image ref -- distinct from
-    _split_image_repo, which discards this entirely since none of its
-    existing callers needed it before this. Defaults to 'latest' when the
-    ref carries neither, matching what `docker pull` and Portainer itself
-    both default to."""
     if not image_ref:
         return "latest"
     if "@" in image_ref:
-        return image_ref.split("@", 1)[1]  # a digest reference, e.g. "sha256:..."
+        return image_ref.split("@", 1)[1]
     last_segment = image_ref.rsplit("/", 1)[-1]
     if ":" in last_segment:
         return last_segment.rsplit(":", 1)[-1]
@@ -554,10 +551,6 @@ def _extract_reference(image_ref: str) -> str:
 
 
 async def _registry_anon_token(hass: HomeAssistant, auth_url: str, service: str, repo: str) -> str | None:
-    """The short-lived anonymous bearer token Docker Hub and ghcr.io both
-    require even for reading a PUBLIC image's manifest -- no credentials
-    involved, this is the same token `docker pull` itself fetches
-    silently for an anonymous pull."""
     session = aiohttp_client.async_get_clientsession(hass)
     params = {"service": service, "scope": f"repository:{repo}:pull"}
     try:
@@ -573,11 +566,6 @@ async def _registry_anon_token(hass: HomeAssistant, auth_url: str, service: str,
 async def _fetch_registry_json(
     hass: HomeAssistant, url: str, token: str | None, accept: str | None = None
 ) -> dict | None:
-    """Shared GET-and-parse-JSON helper for both the manifest and config
-    blob fetches below -- same auth header, same error handling, same
-    "missing/broken response just means None" contract as every other
-    discovery helper in this file (a network hiccup here must never break
-    the wider update-checking poll)."""
     session = aiohttp_client.async_get_clientsession(hass)
     headers: dict[str, str] = {}
     if token:
@@ -594,13 +582,6 @@ async def _fetch_registry_json(
 
 
 async def _fetch_oci_source_label(hass: HomeAssistant, host: str | None, repo: str, reference: str) -> str | None:
-    """The image's own org.opencontainers.image.source label, read off its
-    manifest/config -- see the module comment above this section for why
-    this exists and what it fixes. Returns None (never raises) for any
-    registry this integration doesn't know how to talk to, any image that
-    doesn't set the label, or any network/parsing hiccup along the way --
-    callers treat that identically to "nothing found," same as the
-    guess/README-scrape methods."""
     registry_info = _REGISTRY_MANIFEST_ENDPOINTS.get(host)
     if registry_info is None:
         return None
@@ -611,8 +592,6 @@ async def _fetch_oci_source_label(hass: HomeAssistant, host: str | None, repo: s
         hass, f"{registry_base}/v2/{repo}/manifests/{reference}", token, _MANIFEST_ACCEPT_HEADER
     )
     if manifest is None and token is not None:
-        # A public image can sometimes be read without a token at all --
-        # worth one more try before giving up entirely.
         manifest = await _fetch_registry_json(
             hass, f"{registry_base}/v2/{repo}/manifests/{reference}", None, _MANIFEST_ACCEPT_HEADER
         )
@@ -622,10 +601,6 @@ async def _fetch_oci_source_label(hass: HomeAssistant, host: str | None, repo: s
     if manifest.get("mediaType") in _MANIFEST_LIST_MEDIA_TYPES or (
         "manifests" in manifest and "config" not in manifest
     ):
-        # Multi-arch index -- the label lives on each platform's own
-        # manifest (set from the same Dockerfile LABEL line for every
-        # arch), so any one platform's value is authoritative. Just
-        # resolve the first one listed.
         entries = manifest.get("manifests") or []
         if not entries or not isinstance(entries[0], dict):
             return None
@@ -658,21 +633,6 @@ async def _fetch_oci_source_label(hass: HomeAssistant, host: str | None, repo: s
 # Coordinators -- one per sensor, matching the original recompute cadence.
 # ---------------------------------------------------------------------------
 
-# Confirmed, unfixed, unmerged HA core bug (home-assistant/core#182584): a
-# portainer update.* entity's own internal watcher cache is keyed to the
-# container's OLD id, so after perform_update actually recreates it, this
-# entity's state can keep reporting "on" (update available) for as long as
-# 24h -- its own next full rescan -- even though the update genuinely
-# completed. We can't fix that cache from here; instead, once
-# perform_update tells us a given update_entity's recreate went through
-# (see __init__.py), we hide that entity from this list ourselves for a
-# while, rather than showing the user a "pending update" we already know
-# is stale. Set past the full 24h the core bug can persist, rather than
-# stopping short of it -- a suppression that expires early just means the
-# blueprint treats the stale "on" reappearing as a *newly appeared* update
-# and sends a fresh push about it, which is worse than the original
-# problem. A second *real* update landing for the same container within
-# 25h of the last one is effectively never going to happen in practice.
 RECENTLY_CONFIRMED_GRACE = timedelta(hours=25)
 
 
@@ -682,39 +642,14 @@ class PortainerUpdatesCoordinator(DataUpdateCoordinator[list[dict]]):
     def __init__(self, hass: HomeAssistant) -> None:
         super().__init__(hass, _LOGGER, name=SENSOR_UPDATES_PENDING, update_interval=timedelta(minutes=5))
         self._recently_confirmed: dict[str, datetime] = {}
-        # Changelog-URL discovery result per normalized image repo path,
-        # including a cached None for "looked, found nothing" -- so a
-        # never-mapped image (or one whose registry/README yields nothing
-        # useful) is only ever attempted once per HA restart, not every
-        # 5-minute poll.
         self._changelog_cache: dict[str, str | None] = {}
 
     def mark_recently_updated(self, update_entity: str) -> None:
-        """Called by __init__.py's perform_update once a recreate for this
-        entity has actually gone through (with or without hitting the
-        network_mode:service:X daemon-conflict case) -- see
-        RECENTLY_CONFIRMED_GRACE above for why this exists."""
         self._recently_confirmed[update_entity] = dt_util.utcnow()
 
     async def _resolve_changelog_url(
         self, entity_reg: er.EntityRegistry, container_device_id: str | None
     ) -> str | None:
-        """The changelog/releases URL for a container's current image, in
-        precedence order: (1) CHANGELOG_OVERRIDES_FILENAME, a JSON file in
-        HA's config directory Bob can edit directly with no rebuild/release
-        needed -- see that constant's comment for the full story and file
-        format; (2) the built-in _KNOWN_CHANGELOG_URLS table, the shipped
-        defaults; (3) an auto-discovery attempt (cached after the first
-        try, successful or not), which itself tries the image's own
-        org.opencontainers.image.source label FIRST (see
-        _fetch_oci_source_label's docstring -- the authoritative answer,
-        not a guess, and what actually resolves a monorepo publishing
-        multiple differently-named images) before falling back to the
-        naming-guess/README-scrape methods. Reads the sibling
-        sensor.<name>_image entity core's portainer integration already
-        creates on the same device -- same "look at what's already on this
-        device" pattern _stack_info uses for a stack's switch entity, just
-        on the container's own device instead of its parent."""
         if container_device_id is None:
             return None
         image_entity_id = _container_image_entity_id(self.hass, entity_reg, container_device_id)
@@ -743,15 +678,6 @@ class PortainerUpdatesCoordinator(DataUpdateCoordinator[list[dict]]):
 
         discovered: str | None = None
         try:
-            # Try the authoritative source first: the image's own
-            # org.opencontainers.image.source label, if it set one. This is
-            # what actually resolves a monorepo (see _fetch_oci_source_label's
-            # docstring) rather than guessing a GitHub path from naming --
-            # and it costs nothing extra for an image that DOESN'T set the
-            # label, since _fetch_oci_source_label returns None quickly for
-            # a registry/host it doesn't recognize or a manifest with no
-            # such label, falling straight through to the existing
-            # per-host guess logic below unchanged.
             reference = _extract_reference(image_ref)
             label_source = await _fetch_oci_source_label(self.hass, host, repo, reference)
             if label_source:
@@ -764,57 +690,23 @@ class PortainerUpdatesCoordinator(DataUpdateCoordinator[list[dict]]):
             elif host == "ghcr.io":
                 guess = _guess_repo_url_from_path(repo)
                 if guess:
-                    # _guess_repo_url_from_path returns the repo's home
-                    # page -- the actual changelog content lives on its
-                    # Releases page, not the README, so that's what gets
-                    # linked and verified (a repo with GitHub Releases
-                    # disabled still 200s on /releases with an empty list,
-                    # so this check is still meaningful even then).
                     guess_releases = f"{guess}/releases"
                     if await _verify_github_url(self.hass, guess_releases):
                         discovered = guess_releases
             elif host is None or host in (
-                "docker.io", "index.docker.io", "registry-1.docker.io",
-                # lscr.io is linuxserver.io's own pull-through mirror of
-                # their Docker Hub images, at identical namespace/repo
-                # paths (documented by linuxserver.io itself) -- so it's
-                # the exact same lookup as a real Docker Hub image, just
-                # pulled through a different hostname. This is what makes
-                # discovery actually cover LSIO, the whole point of it.
-                "lscr.io",
+                "docker.io", "index.docker.io", "registry-1.docker.io", "lscr.io",
             ):
-                # Try the direct owner/repo guess FIRST, same as ghcr.io
-                # above -- this is exactly right for any project whose
-                # Docker Hub namespace matches its GitHub owner and whose
-                # repo is named identically in both places. That's every
-                # one of Bob's own images (bdelima/ha-portainer-sidecar,
-                # bdelima/tailscale-exporter, etc: same username on both
-                # platforms, matching repo names by convention) -- and
-                # this branch used to skip straight to README-scraping,
-                # which only ever finds a link if the Docker Hub listing's
-                # description text happens to contain one. A minimal
-                # personal project's Docker Hub page frequently has no
-                # populated README at all, so the direct guess was the
-                # missing, much simpler case, not an edge case.
                 guess = _guess_repo_url_from_path(repo)
                 if guess:
                     guess_releases = f"{guess}/releases"
                     if await _verify_github_url(self.hass, guess_releases):
                         discovered = guess_releases
                 if discovered is None:
-                    # Falls back to README-scraping only when the direct
-                    # guess doesn't verify -- the case this exists for is
-                    # linuxserver.io, whose GitHub repos are named
-                    # "docker-<app>", not "<app>", so lscr.io/linuxserver/plex
-                    # can never resolve via the direct guess above.
                     candidate = await _fetch_dockerhub_github_url(self.hass, repo)
                     if candidate:
                         candidate_releases = f"{candidate}/releases"
                         if await _verify_github_url(self.hass, candidate_releases):
                             discovered = candidate_releases
-            # Any other registry host (private/self-hosted) -- no generic,
-            # credential-free way to discover from here; discovered stays
-            # None, same as an unmapped image before this feature existed.
         except Exception:  # never let a discovery hiccup break a poll cycle
             _LOGGER.debug("%s: changelog auto-discovery failed for %s", DOMAIN, repo, exc_info=True)
             discovered = None
@@ -830,57 +722,36 @@ class PortainerUpdatesCoordinator(DataUpdateCoordinator[list[dict]]):
         found: list[dict] = []
         now = dt_util.utcnow()
 
+        # Computed once per poll, not once per item -- see
+        # _stacks_with_open_trouble's docstring. Cheap (registry/state
+        # reads only), so no reason to cache it further.
+        stuck_stacks = _stacks_with_open_trouble(self.hass, entity_reg, device_reg)
+
         for entity_id in _portainer_entity_ids(entity_reg):
             if not entity_id.startswith("update."):
                 continue
             state = self.hass.states.get(entity_id)
             if state is None or state.state == "off":
-                # Gone, or genuinely confirmed no-update-pending -- either
-                # way trustworthy on its own, so drop any suppression for
-                # it immediately rather than waiting out the grace window,
-                # so a real subsequent update is never masked by a stale
-                # entry.
                 self._recently_confirmed.pop(entity_id, None)
                 continue
             if state.state != "on":
-                # Something else -- most likely "unavailable", which the
-                # entity can go through transiently while its container is
-                # mid-recreate, or during an unrelated core-integration
-                # polling hiccup. That's not a trustworthy "no update"
-                # signal the way "off" is, so leave any existing
-                # suppression alone rather than let a flicker resurface
-                # the known-stale "on" the moment it comes back.
                 continue
 
             confirmed_at = self._recently_confirmed.get(entity_id)
             if confirmed_at is not None:
                 if now - confirmed_at < RECENTLY_CONFIRMED_GRACE:
                     continue
-                # Grace window elapsed and core still reports "on" -- the
-                # 24h cache is the likely explanation, but we've done what
-                # we reasonably can; let it reappear rather than hide it
-                # forever on the strength of one confirmation.
                 del self._recently_confirmed[entity_id]
 
             reg_entry = entity_reg.async_get(entity_id)
             device_id = reg_entry.device_id if reg_entry else None
             root_id = _walk_to_root(device_reg, device_id)
             host = _device_name(device_reg, root_id) or "unknown host"
-            # The CONTAINER's own device name, not the update entity's
-            # friendly_name -- core's portainer integration names update.*
-            # entities things like "resilio-sync Image update available",
-            # which is fine as an entity name but reads badly wherever this
-            # "name" field gets dropped into a sentence (the webapp's row
-            # label, and the automation blueprint's "Update available" push
-            # message both use it directly). PortainerTroubleCoordinator and
-            # PortainerStaleCoordinator below already do it this way; this
-            # brings updates_pending in line with them instead of falling
-            # back to the entity's own friendly_name unless the device
-            # lookup genuinely comes up empty.
             container_name = _device_name(device_reg, device_id) or state.attributes.get(
                 "friendly_name", entity_id
             )
             stack_name, stack_switch_entity_id = _stack_info(device_reg, entity_reg, device_id)
+            stack_dev_id = _stack_device_id(device_reg, device_id)
             changelog_url = await self._resolve_changelog_url(entity_reg, device_id)
 
             found.append(
@@ -888,15 +759,17 @@ class PortainerUpdatesCoordinator(DataUpdateCoordinator[list[dict]]):
                     "entity": entity_id,
                     "name": f"{container_name} ({host})",
                     "secondary_info": "Update available",
-                    # None/None for a standalone container not part of a
-                    # stack -- the dashboard's tree view groups those under
-                    # a flat "Standalone" bucket instead of a named stack.
+                    "host": host,
+                    "host_device_id": root_id,
                     "stack_name": stack_name,
+                    "stack_device_id": stack_dev_id,
                     "stack_switch_entity_id": stack_switch_entity_id,
-                    # None when there's no override AND discovery couldn't
-                    # verify a link (or the registry isn't one it knows how
-                    # to read) -- the dashboard just omits the link.
                     "changelog_url": changelog_url,
+                    # (1.3.0) True when this container's stack has an open
+                    # "needs a restart" Trouble item -- the webapp badges
+                    # the stack's row with this so a fresh install doesn't
+                    # get triggered blind while a restart is still owed.
+                    "stack_has_open_trouble": bool(stack_dev_id and stack_dev_id in stuck_stacks),
                 }
             )
 
@@ -904,10 +777,30 @@ class PortainerUpdatesCoordinator(DataUpdateCoordinator[list[dict]]):
 
 
 class PortainerTroubleCoordinator(DataUpdateCoordinator[list[dict]]):
-    """Ports the original 1-minute trouble_items template (120s settle)."""
+    """Broadened (1.3.0) past individual containers to also cover:
+
+      - an Endpoint that's dropped out of core's own coordinator data
+        entirely (kind="endpoint") -- core gives no dedicated signal for
+        this; every entity on the device just goes unavailable. Settled
+        the same TROUBLE_SETTLE_SECONDS as container issues, to avoid
+        flapping on a brief poll hiccup. Carries the endpoint's own
+        device_id so the webapp's Reload Endpoint button can call
+        portainer_maintenance.reload_endpoint directly.
+
+      - a container stuck on the known network_mode:service:X daemon-
+        conflict bug (see _find_stuck_containers): kind="stack_restart_needed"
+        when it's part of a real Portainer stack (carries switch_entity_id
+        so the webapp's Restart Stack Now button can call the existing
+        portainer_maintenance.restart_stack service directly), or
+        kind="unstacked_recreate" when it isn't (no remediation possible
+        from here -- info-only, with a fuller "detail" string for the
+        webapp's More Info dialog). Deliberately NOT settled -- see
+        _find_stuck_containers's docstring for why this is stateless and
+        needs no settle window to avoid flapping.
+    """
 
     def __init__(self, hass: HomeAssistant) -> None:
-        super().__init__(hass, _LOGGER, name=SENSOR_CONTAINER_TROUBLE, update_interval=timedelta(minutes=1))
+        super().__init__(hass, _LOGGER, name=SENSOR_TROUBLE, update_interval=timedelta(minutes=1))
 
     async def _async_update_data(self) -> list[dict]:
         entity_reg = er.async_get(self.hass)
@@ -916,12 +809,32 @@ class PortainerTroubleCoordinator(DataUpdateCoordinator[list[dict]]):
         portainer_ids = _portainer_entity_ids(entity_reg)
         found: list[dict] = []
 
-        def _host_and_name(entity_id: str, device_id: str | None) -> tuple[str, str | None]:
+        def _host_and_name(device_id: str | None) -> tuple[str, str | None]:
             root_id = _walk_to_root(device_reg, device_id)
             host = _device_name(device_reg, root_id) or "unknown host"
             name = _device_name(device_reg, device_id)
             return host, name
 
+        # -- Endpoint unreachable --------------------------------------
+        for endpoint_device_id in _discover_endpoint_devices(entity_reg, device_reg):
+            since = _endpoint_unavailable_since(self.hass, entity_reg, endpoint_device_id)
+            if since is None:
+                continue
+            if (now - since).total_seconds() < TROUBLE_SETTLE_SECONDS:
+                continue
+            host = _device_name(device_reg, endpoint_device_id) or "unknown host"
+            found.append(
+                {
+                    "kind": "endpoint",
+                    "device_id": endpoint_device_id,
+                    "host": host,
+                    "host_device_id": endpoint_device_id,
+                    "name": host,
+                    "secondary_info": "Unreachable — reload the endpoint to reconnect",
+                }
+            )
+
+        # -- Container exited / unhealthy (unchanged from pre-1.3.0) ---
         for entity_id in portainer_ids:
             if not entity_id.endswith("_state"):
                 continue
@@ -933,9 +846,19 @@ class PortainerTroubleCoordinator(DataUpdateCoordinator[list[dict]]):
 
             reg_entry = entity_reg.async_get(entity_id)
             device_id = reg_entry.device_id if reg_entry else None
-            host, name = _host_and_name(entity_id, device_id)
+            host, name = _host_and_name(device_id)
             display_name = name or state.attributes.get("friendly_name", entity_id)
-            found.append({"entity": entity_id, "name": f"{display_name} ({host})", "secondary_info": state.state})
+            found.append(
+                {
+                    "kind": "container_exited",
+                    "entity": entity_id,
+                    "host": host,
+                    "host_device_id": _walk_to_root(device_reg, device_id),
+                    "stack_name": _stack_info(device_reg, entity_reg, device_id)[0],
+                    "name": f"{display_name} ({host})",
+                    "secondary_info": state.state,
+                }
+            )
 
         for entity_id in portainer_ids:
             if not entity_id.endswith("_health"):
@@ -948,9 +871,58 @@ class PortainerTroubleCoordinator(DataUpdateCoordinator[list[dict]]):
 
             reg_entry = entity_reg.async_get(entity_id)
             device_id = reg_entry.device_id if reg_entry else None
-            host, name = _host_and_name(entity_id, device_id)
+            host, name = _host_and_name(device_id)
             display_name = name or state.attributes.get("friendly_name", entity_id)
-            found.append({"entity": entity_id, "name": f"{display_name} ({host})", "secondary_info": "unhealthy"})
+            found.append(
+                {
+                    "kind": "container_unhealthy",
+                    "entity": entity_id,
+                    "host": host,
+                    "host_device_id": _walk_to_root(device_reg, device_id),
+                    "stack_name": _stack_info(device_reg, entity_reg, device_id)[0],
+                    "name": f"{display_name} ({host})",
+                    "secondary_info": "unhealthy",
+                }
+            )
+
+        # -- network_mode:service:X daemon-conflict, stuck containers ---
+        for item in _find_stuck_containers(self.hass, entity_reg, device_reg):
+            if item["stack_name"]:
+                found.append(
+                    {
+                        "kind": "stack_restart_needed",
+                        "device_id": item["device_id"],
+                        "host": item["host"],
+                        "host_device_id": item["host_device_id"],
+                        "stack_name": item["stack_name"],
+                        "stack_device_id": item["stack_device_id"],
+                        "switch_entity_id": item["switch_entity_id"],
+                        "name": item["container_name"],
+                        "secondary_info": "Image updated — stack restart needed",
+                    }
+                )
+            else:
+                found.append(
+                    {
+                        "kind": "unstacked_recreate",
+                        "device_id": item["device_id"],
+                        "host": item["host"],
+                        "host_device_id": item["host_device_id"],
+                        "name": item["container_name"],
+                        "secondary_info": "Image updated, tag stale",
+                        "detail": (
+                            f"{item['container_name']}'s image was pulled successfully, but the "
+                            "container itself couldn't be recreated cleanly -- a known Portainer/"
+                            "Docker limitation for containers sharing another container's network "
+                            "(network_mode: service:<other> or container:<other>, e.g. a VPN sidecar "
+                            "setup). Since this container isn't managed as a Portainer stack, it "
+                            "can't be restarted automatically from here. It most likely lives in a "
+                            "Docker Compose project that Portainer doesn't manage -- recreate it "
+                            "manually (`docker compose up -d` on its host, or via Portainer's own "
+                            "UI) to finish applying the update."
+                        ),
+                    }
+                )
 
         return found
 
@@ -978,13 +950,6 @@ class PortainerStaleCoordinator(DataUpdateCoordinator[list[dict]]):
         for device_id in devices_seen:
             root_id = _walk_to_root(device_reg, device_id)
 
-            # A device with no via_device_id IS a root Endpoint -- never a
-            # candidate for "stale child device" itself. Without this guard,
-            # an endpoint whose own entities go unavailable for 12h+ (the
-            # whole host down, not a removed container) would misleadingly
-            # show up in the stale list, since it has no separate "parent"
-            # to check health against. Found via the logic port's own test
-            # suite -- this edge case was latent in the original Jinja too.
             if root_id == device_id:
                 continue
 
@@ -1033,7 +998,55 @@ class PortainerStaleCoordinator(DataUpdateCoordinator[list[dict]]):
                     "name": f"{name} ({host_name})",
                     "secondary_info": "Stale — 12h+ unavailable, host healthy",
                     "device_id": device_id,
+                    "host": host_name,
+                    "host_device_id": root_id,
                     "navigation_path": f"/config/devices/device/{device_id}",
+                }
+            )
+
+        return found
+
+
+class PortainerCleanupCoordinator(DataUpdateCoordinator[list[dict]]):
+    """(1.3.0, new) One item per Portainer endpoint, backing the webapp's
+    Cleanup tab. There's no accurate per-endpoint dangling-image count
+    anywhere in HA's own entities -- core's image_disk_usage_reclaimable
+    sensor gives a byte-accurate total across ALL unused images together,
+    dangling or not, with no way to split it. `unused_estimate` is
+    `images_count - containers_count` from core's own per-endpoint
+    diagnostic sensors instead -- a rough "how many images exist beyond
+    what's running" figure, good enough to seed a badge, not a precise
+    dangling count. reclaimable_mib is the real byte-accurate figure
+    (None when that sensor reads unknown/unavailable -- see
+    _numeric_state, never treat None as 0 here)."""
+
+    def __init__(self, hass: HomeAssistant) -> None:
+        super().__init__(hass, _LOGGER, name=SENSOR_CLEANUP, update_interval=timedelta(minutes=5))
+
+    async def _async_update_data(self) -> list[dict]:
+        entity_reg = er.async_get(self.hass)
+        device_reg = dr.async_get(self.hass)
+        found: list[dict] = []
+
+        for endpoint_device_id in _discover_endpoint_devices(entity_reg, device_reg):
+            host = _device_name(device_reg, endpoint_device_id) or "unknown host"
+
+            images = _numeric_state(self.hass, _endpoint_images_count_entity(entity_reg, endpoint_device_id))
+            containers = _numeric_state(self.hass, _endpoint_containers_count_entity(entity_reg, endpoint_device_id))
+            unused_estimate = max(int(images) - int(containers), 0) if images is not None and containers is not None else None
+
+            reclaimable_mib = _numeric_state(self.hass, _endpoint_reclaimable_entity(entity_reg, endpoint_device_id))
+            volume_usage_mib = _numeric_state(self.hass, _endpoint_volume_usage_entity(entity_reg, endpoint_device_id))
+            volumes_prune_button = _endpoint_volumes_prune_button(entity_reg, endpoint_device_id)
+
+            found.append(
+                {
+                    "host": host,
+                    "device_id": endpoint_device_id,
+                    "unused_estimate": unused_estimate,
+                    "reclaimable_mib": reclaimable_mib,
+                    "volume_usage_mib": volume_usage_mib,
+                    "volumes_prune_button": volumes_prune_button,
                 }
             )
 
@@ -1075,13 +1088,36 @@ class _PortainerListSensor(CoordinatorEntity[DataUpdateCoordinator], SensorEntit
         return {"items": self.coordinator.data or []}
 
 
-class PortainerActionsUrlSensor(SensorEntity):
-    """Read-only, auto-computed click-through URL for phone notifications.
+class _PortainerCleanupSensor(CoordinatorEntity[DataUpdateCoordinator], SensorEntity):
+    """Same shape as _PortainerListSensor, but its native_value is the sum
+    of each endpoint's unused_estimate (running total across all hosts),
+    not len(items) -- one entry per endpoint here, not one per issue."""
 
-    Nothing to configure -- it's derived from this HA instance's own
-    external/internal URL plus the fixed sidebar panel path registered in
-    __init__.py, so there's no value here that can be entered wrong.
-    """
+    _attr_has_entity_name = False
+
+    def __init__(self, coordinator: DataUpdateCoordinator, name: str, object_id: str, entry: ConfigEntry) -> None:
+        super().__init__(coordinator)
+        self._attr_name = name
+        self._attr_unique_id = f"{entry.entry_id}_{object_id}"
+        self.entity_id = f"sensor.{object_id}"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry.entry_id)},
+            name="Portainer Maintenance",
+            entry_type=DeviceEntryType.SERVICE,
+        )
+
+    @property
+    def native_value(self) -> int:
+        items = self.coordinator.data or []
+        return sum(item.get("unused_estimate") or 0 for item in items)
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        return {"items": self.coordinator.data or []}
+
+
+class PortainerActionsUrlSensor(SensorEntity):
+    """Read-only, auto-computed click-through URL for phone notifications."""
 
     _attr_has_entity_name = False
     _attr_icon = "mdi:link"
@@ -1105,15 +1141,18 @@ async def async_setup_entry(
     updates_coordinator = PortainerUpdatesCoordinator(hass)
     trouble_coordinator = PortainerTroubleCoordinator(hass)
     stale_coordinator = PortainerStaleCoordinator(hass)
+    cleanup_coordinator = PortainerCleanupCoordinator(hass)
 
     await updates_coordinator.async_config_entry_first_refresh()
     await trouble_coordinator.async_config_entry_first_refresh()
     await stale_coordinator.async_config_entry_first_refresh()
+    await cleanup_coordinator.async_config_entry_first_refresh()
 
     hass.data[DOMAIN][entry.entry_id]["coordinators"] = {
         "updates": updates_coordinator,
         "trouble": trouble_coordinator,
         "stale": stale_coordinator,
+        "cleanup": cleanup_coordinator,
     }
 
     actions_url = hass.data[DOMAIN][entry.entry_id].get("actions_url", "")
@@ -1121,8 +1160,9 @@ async def async_setup_entry(
     async_add_entities(
         [
             _PortainerListSensor(updates_coordinator, "Portainer updates pending", SENSOR_UPDATES_PENDING, entry),
-            _PortainerListSensor(trouble_coordinator, "Portainer container trouble", SENSOR_CONTAINER_TROUBLE, entry),
+            _PortainerListSensor(trouble_coordinator, "Portainer trouble", SENSOR_TROUBLE, entry),
             _PortainerListSensor(stale_coordinator, "Portainer stale devices", SENSOR_STALE_DEVICES, entry),
+            _PortainerCleanupSensor(cleanup_coordinator, "Portainer cleanup", SENSOR_CLEANUP, entry),
             PortainerActionsUrlSensor(entry, actions_url),
         ]
     )

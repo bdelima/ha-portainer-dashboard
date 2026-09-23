@@ -53,6 +53,65 @@ prune_images:
           min: 1
           max: 8760
           mode: box
+    device_ids:
+      name: Endpoints (optional)
+      description: >-
+        Limit this run to specific endpoint device(s) instead of every
+        discovered host -- used by the webapp's Cleanup tab, where a
+        single tree row targets one host. Leave blank to prune every
+        discovered Portainer endpoint, same as before this field existed.
+      required: false
+      selector:
+        device:
+          integration: portainer
+          model: Endpoint
+          multiple: true
+
+prune_volumes:
+  name: Prune volumes
+  description: >-
+    Reclaims disk space by pruning unused Docker volumes, across every
+    discovered Portainer endpoint or specific one(s) via device_ids.
+    Core's portainer integration has no dedicated service for this --
+    only a button.*_volumes_prune entity per endpoint (the same action
+    Portainer's own "Prune unused volumes" button performs) -- so this
+    wraps that button via the standard button.press service instead of
+    duplicating core's own pruning logic. Offered as a courtesy on the
+    Cleanup tab: core's own volume entities give limited visibility into
+    what's actually unused, so treat this as "the same button Portainer's
+    UI has," not a more informed decision than pressing it there yourself.
+  fields:
+    device_ids:
+      name: Endpoints (optional)
+      description: >-
+        Limit this run to specific endpoint device(s) instead of every
+        discovered host. Leave blank to prune volumes on every discovered
+        Portainer endpoint.
+      required: false
+      selector:
+        device:
+          integration: portainer
+          model: Endpoint
+          multiple: true
+
+reload_endpoint:
+  name: Reload endpoint
+  description: >-
+    Reloads the core portainer config entry that owns the given endpoint
+    device -- the same reload Settings -> Devices & Services -> Portainer
+    -> Reload performs from the UI. Core's own integration silently drops
+    an endpoint from its data the moment it can't reach it, with no error
+    and no dedicated "endpoint unavailable" entity of its own; this is the
+    remediation the dashboard's Trouble tab offers for that case.
+  fields:
+    device_id:
+      name: Endpoint
+      description: The endpoint device_id to reload.
+      required: true
+      selector:
+        device:
+          integration: portainer
+          model: Endpoint
 
 perform_update:
   name: Perform update

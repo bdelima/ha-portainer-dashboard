@@ -1,97 +1,79 @@
 """Portainer Maintenance.
 
-Formerly "Portainer Cleanup" -- renamed and expanded once the design grew
-past "expose one service" into a real maintenance layer on top of the core
-`portainer` integration. On setup this integration:
+On setup this integration:
 
 1. Registers `portainer_maintenance.remove_device`, built on the stable
-   `device_registry.async_remove_device()` API -- the webapp's stale-device
-   delete calls this, because the native Settings -> Devices page's own
-   Delete button calls an internal frontend WebSocket command, not a
-   documented service.
+   `device_registry.async_remove_device()` API.
 
 1b. Registers `portainer_maintenance.perform_update` and
-   `portainer_maintenance.update_done` -- native services, not blueprint
-   scripts. These used to be `bundled_blueprints/script/*.yaml`, each
-   requiring the user to create a script instance from the blueprint and
-   then manually override its auto-generated Entity ID to match the exact
-   literal string (`portainer_perform_update` / `portainer_update_done`)
-   the merged automation blueprint calls by name -- an easy step to miss
-   or get wrong, and when missed, HA reports it as an opaque "automation
-   uses an unknown action" repair with no obvious link back to that
-   missed step. A native service has no user-assigned entity_id to get
-   wrong in the first place: it's registered under this fixed domain the
-   moment the integration loads, same as remove_device/prune_images
-   above. The two scripts read who to notify from this config entry's
-   notify_devices (see config_flow.py) instead of a blueprint input,
-   since a plain service call has no blueprint inputs to read from.
+   `portainer_maintenance.update_done` -- native services for actually
+   installing an update and posting the "update performed" confirmation.
 
 1c. Registers `portainer_maintenance.restart_stack` -- a stop/start of a
-   whole Portainer stack's switch.* entity (HA core's portainer
-   integration already provides one per stack). This exists for a
-   confirmed, unfixed Portainer bug: recreating a single container whose
-   network_mode is `service:<other>` / `container:<other>` (a VPN sidecar
-   pattern like gluetun) makes Docker's daemon reject the create call
-   over a hostname/network_mode conflict -- reproduced identically via
-   Portainer's own UI, nothing to do with HA or this integration. The
-   pull+recreate still actually completes despite the error, but the
-   image tag only reconciles cleanly once the owning stack is restarted.
-   `perform_update` below catches that failure (instead of aborting) and
-   offers the phone notification's "Restart Stack Now" action as a
-   follow-up, rather than restarting automatically -- a full stack
-   restart bounces every other container in it too, which shouldn't
-   happen silently.
+   whole Portainer stack's switch.* entity. Exists for a confirmed,
+   unfixed Portainer bug: recreating a single container whose network_mode
+   is `service:<other>` / `container:<other>` (a VPN sidecar pattern like
+   gluetun) makes Docker's daemon reject the create call over a
+   hostname/network_mode conflict -- reproduced identically via
+   Portainer's own UI. The pull+recreate still actually completes despite
+   the error, but the image tag only reconciles cleanly once the owning
+   stack is restarted. `perform_update` detects that case (see
+   `_await_recreate_outcome`) without trusting the wrapped exception text,
+   by watching the container's own image reference degrade to a bare
+   digest.
 
-   Telling that case apart from a genuine failure does NOT work by
-   matching the exception's text -- confirmed in production that HA
-   core's own portainer integration wraps every recreate_container
-   failure into the same generic HomeAssistantError regardless of cause,
-   so the real Docker/Portainer error text never reaches this code at
-   all. Instead, on any recreate failure for a container that's part of
-   a stack, `perform_update` watches what actually happens to that
-   container's own image reference over the following couple of minutes
-   (core's own portainer coordinator only polls Docker every 60s, so
-   this has to span at least two of its cycles): the known conflict's
-   real, observable symptom is the image reference degrading to a bare
-   content digest instead of settling on a normal tag. See
-   `_await_recreate_outcome` for the full reasoning.
+   (1.3.0) That detection now ALSO runs continuously, independent of any
+   particular perform_update call, as part of the broadened
+   sensor.portainer_trouble (see sensor.py's PortainerTroubleCoordinator
+   and `_find_stuck_containers`) -- so a stack stuck in this state is
+   discoverable and actionable (a Restart Stack Now button calling this
+   same restart_stack service) from the dashboard's Trouble tab at any
+   time, not just in the few minutes right after triggering the update
+   that caused it, and it survives an HA/integration restart for free
+   (the check is stateless, re-derived from live entity state every poll).
+   The phone push this integration sends when it detects the case live
+   during perform_update is now purely informational -- it used to carry
+   an inline "Restart Stack Now" action, dropped in 1.3.0 in favor of
+   sending the user to the Trouble tab, since a stack can have several
+   independent per-container update notifications in flight at once and a
+   one-tap restart from any one of them made that workflow feel
+   disconnected from the others.
 
-1d. Registers `portainer_maintenance.hide_update_entities` -- scans every
-   Portainer update.* entity and hides any that aren't already hidden.
-   Closes a manual per-new-container setup step (Setup steps used to say
-   "hide its update.* entity" as an ongoing chore) the same way the
-   services above closed manual steps for their own areas. The blueprint
-   calls this at HA startup and whenever a new entity_registry entry is
-   created, so a newly-added container's update entity gets hidden
-   automatically instead of needing to be found and hidden by hand.
+1d. Registers `portainer_maintenance.reload_endpoint` (1.3.0) -- reloads
+   the core `portainer` config entry that owns a given device, the same
+   reload Settings -> Devices & Services -> Portainer -> Reload performs.
+   Exists because core's own integration silently drops an endpoint from
+   its data the moment it can't reach it -- no error, no dedicated
+   "endpoint unavailable" entity anywhere -- which sensor.portainer_trouble
+   now surfaces as an actionable item instead of something only noticed by
+   accident.
+
+1e. Registers `portainer_maintenance.prune_images` (now optionally scoped
+   to specific endpoint(s) via `device_ids`, 1.3.0) and
+   `portainer_maintenance.prune_volumes` (1.3.0, new) -- reclaims disk
+   space, discovered automatically from the device registry the same way
+   as everywhere else in this integration. Both nudge the relevant core
+   entities to refresh shortly after acting (see `_refresh_after_action`),
+   since core's own `portainer.prune_images` service does not call
+   `coordinator.async_request_refresh()` itself the way its button/switch
+   entities do.
+
+1f. Registers `portainer_maintenance.hide_update_entities`.
 
 2. Installs its bundled automation blueprint into HA's config dir
-   automatically (see bundled_blueprints/) -- no more separate SSH deploy
-   step for that. Re-copied on every load, so treat the deployed copy as
-   generated, not hand-editable.
+   automatically.
 
 3. Registers an iframe sidebar panel pointing at the Portainer actions
-   webapp, at a fixed, known path (PANEL_PATH) -- via the same
-   `frontend.async_register_built_in_panel` primitive the legacy
-   `panel_iframe` YAML integration used, just invoked from a config-flow
-   integration instead of static YAML. This removes the old manual
-   "Add Dashboard -> Webpage -> read the random URL from the address bar"
-   step entirely.
+   webapp, at a fixed, known path (PANEL_PATH).
 
 4. Computes the notification click-through URL automatically and exposes
-   it as a read-only sensor (see sensor.py) -- no typing a URL into a
-   text helper or config field. It's a bare relative path (/PANEL_PATH),
-   which the HA companion app treats as "navigate within the server I'm
-   already connected to" -- so tapping a notification always opens the
-   sidebar panel in-app, with no dependency on HA's own external/internal
-   URL (Settings -> System -> Network) being configured at all.
+   it as a read-only sensor. (1.3.0) A `#trouble` fragment variant is also
+   used for the stack-restart-needed push, so tapping it lands the webapp
+   directly on its Trouble tab.
 
-5. Forwards to the sensor platform, which defines the three tracking
-   sensors (updates pending / container trouble / stale devices) as native
-   entities on coordinators, instead of YAML template sensors in
-   templates.yaml. Their entity_ids are pinned explicitly to match what
-   templates.yaml used to produce (sensor.portainer_updates_pending, etc.)
-   so the merged automation blueprint and the webapp don't need to change.
+5. Forwards to the sensor platform, which defines the tracking sensors
+   (updates pending / trouble / stale devices / cleanup, 1.3.0 adds
+   cleanup and broadens trouble) as native entities on coordinators.
 """
 from __future__ import annotations
 
@@ -115,6 +97,11 @@ from .const import CONF_NOTIFY_DEVICES, CONF_WEBAPP_URL, DOMAIN, PANEL_ICON, PAN
 from .sensor import (
     _container_image_entity_id,
     _device_name,
+    _discover_endpoint_devices,
+    _endpoint_images_count_entity,
+    _endpoint_reclaimable_entity,
+    _endpoint_volume_usage_entity,
+    _endpoint_volumes_prune_button,
     _looks_like_bare_digest,
     _portainer_entity_ids,
     _stack_info,
@@ -125,23 +112,23 @@ _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS = ["sensor"]
 
-# How long to let a stack settle between the stop and start halves of
-# restart_stack -- long enough for Docker to actually tear down the
-# network-owning container's namespace before anything tries to rejoin it.
 STACK_RESTART_SETTLE_SECONDS = 5
 
-# How long to watch a container's image reference after recreate_container
-# raises, before giving up and treating it as a genuine failure -- see
-# _await_recreate_outcome. Core's own `portainer` integration only polls
-# Docker every 60s (DEFAULT_SCAN_INTERVAL in its coordinator, confirmed
-# against its source), so this has to span at least two of ITS refresh
-# cycles, not just ours, or a recreate that lands right after a refresh
-# just completed would time out here before core ever had a chance to see
-# the change. RECREATE_WAIT_POLL_SECONDS just governs how often we check
-# our own already-local hass.states -- cheap, so no reason to wait as long
-# between checks as core does between its own Docker polls.
 RECREATE_WAIT_TIMEOUT_SECONDS = 150
 RECREATE_WAIT_POLL_SECONDS = 5
+
+# (1.3.0) How long prune_images/prune_volumes wait after firing the
+# underlying action before nudging the relevant entities to refresh, and
+# how long they wait after that nudge before returning. homeassistant.
+# update_entity blocks until the targeted entity's own coordinator refresh
+# completes, so PRE_DELAY exists to give the actual prune a moment to be
+# reflected in Portainer/Docker's own state before that refresh is even
+# requested; POST_DELAY is pure safety margin on top of an already-blocking
+# call, not compensating for an async one.
+PRUNE_REFRESH_PRE_DELAY_SECONDS = 3
+PRUNE_REFRESH_POST_DELAY_SECONDS = 1
+
+DISMISS_ACTION = {"action": "dismiss", "title": "Dismiss"}
 
 SERVICE_REMOVE_DEVICE = "remove_device"
 SERVICE_REMOVE_DEVICE_SCHEMA = vol.Schema({vol.Required("device_id"): cv.string})
@@ -151,8 +138,15 @@ SERVICE_PRUNE_IMAGES_SCHEMA = vol.Schema(
     {
         vol.Optional("dangling", default=False): cv.boolean,
         vol.Optional("until_hours"): vol.Coerce(int),
+        vol.Optional("device_ids"): [cv.string],
     }
 )
+
+SERVICE_PRUNE_VOLUMES = "prune_volumes"
+SERVICE_PRUNE_VOLUMES_SCHEMA = vol.Schema({vol.Optional("device_ids"): [cv.string]})
+
+SERVICE_RELOAD_ENDPOINT = "reload_endpoint"
+SERVICE_RELOAD_ENDPOINT_SCHEMA = vol.Schema({vol.Required("device_id"): cv.string})
 
 SERVICE_PERFORM_UPDATE = "perform_update"
 SERVICE_PERFORM_UPDATE_SCHEMA = vol.Schema({vol.Required("update_entity"): cv.entity_id})
@@ -173,9 +167,6 @@ SERVICE_HIDE_UPDATE_ENTITIES_SCHEMA = vol.Schema({})
 
 BUNDLED_BLUEPRINTS_DIR = Path(__file__).parent / "bundled_blueprints"
 
-# (bundled source, relative to BUNDLED_BLUEPRINTS_DIR) -> (dest, relative to config dir)
-# perform_update/update_done used to be here as script blueprints -- see
-# the module docstring (1b.) for why they're native services now instead.
 BLUEPRINT_FILES = [
     (
         "automation/portainer_automations.yaml",
@@ -185,10 +176,6 @@ BLUEPRINT_FILES = [
 
 
 def _notify_services_for_entry(hass: HomeAssistant, entry: ConfigEntry) -> list[str]:
-    """notify.mobile_app_<slug> for each device_id in this entry's
-    notify_devices -- the Python equivalent of the Jinja
-    `map('device_attr', 'name') | map('slugify') | ...` chain the
-    automation blueprint uses for its own notify_device input."""
     device_reg = dr.async_get(hass)
     services = []
     for device_id in entry.data.get(CONF_NOTIFY_DEVICES, []):
@@ -202,13 +189,30 @@ def _notify_services_for_entry(hass: HomeAssistant, entry: ConfigEntry) -> list[
 
 
 def _stack_switch_entity_id(hass: HomeAssistant, container_device_id: str) -> str | None:
-    """Thin wrapper around sensor.py's _stack_info -- same helper the
-    updates-pending sensor uses to group its items by stack, reused here
-    so the two never drift on what counts as "this container's stack"."""
     device_reg = dr.async_get(hass)
     entity_reg = er.async_get(hass)
     _stack_name, switch_entity_id = _stack_info(device_reg, entity_reg, container_device_id)
     return switch_entity_id
+
+
+async def _refresh_after_action(hass: HomeAssistant, entity_ids: list[str | None]) -> None:
+    """Fire-then-nudge shared by prune_images and prune_volumes -- see
+    PRUNE_REFRESH_PRE_DELAY_SECONDS/POST_DELAY_SECONDS above for the
+    reasoning. Silently does nothing if none of the target entities were
+    found (e.g. a suffix-matching assumption in sensor.py didn't hold on
+    this particular HA version) -- a missing refresh target should never
+    fail the underlying prune action itself."""
+    targets = [e for e in entity_ids if e]
+    if not targets:
+        return
+    await asyncio.sleep(PRUNE_REFRESH_PRE_DELAY_SECONDS)
+    try:
+        await hass.services.async_call(
+            "homeassistant", "update_entity", {"entity_id": targets}, blocking=True
+        )
+    except Exception:
+        _LOGGER.debug("%s: update_entity refresh nudge failed for %s", DOMAIN, targets, exc_info=True)
+    await asyncio.sleep(PRUNE_REFRESH_POST_DELAY_SECONDS)
 
 
 async def _await_recreate_outcome(
@@ -222,44 +226,23 @@ async def _await_recreate_outcome(
     decides whether that's the known network_mode:service:X daemon
     conflict or a genuine failure, WITHOUT trusting the exception text.
 
-    An earlier version of this code tried to tell the two apart by
-    matching the exception's string against the daemon's documented
-    error wording ("conflicting options" / "network mode"). Confirmed in
-    production that this can never work: HA core's own portainer
-    integration wraps every recreate_container failure, regardless of
-    cause, into the same generic HomeAssistantError ("An error occurred
-    while trying to connect to the Portainer instance") -- the actual
-    Docker/Portainer error text never survives to reach this code at
-    all, so the substring check was comparing against a message that
-    could never contain it.
-
-    Instead, this watches what actually happens to the container's own
-    image reference -- confirmed in production as the real, observable
-    symptom either way: the pull+recreate genuinely can complete despite
-    the daemon-level create call erroring, and when it does, the image
-    reference degrades to a bare content digest instead of a normal tag,
-    even though the underlying image content is correct. So:
+    Confirmed in production that HA core's own portainer integration wraps
+    every recreate_container failure, regardless of cause, into the same
+    generic HomeAssistantError -- the actual Docker/Portainer error text
+    never survives to reach this code at all. Instead, this watches what
+    actually happens to the container's own image reference: the
+    pull+recreate genuinely can complete despite the daemon-level create
+    call erroring, and when it does, the image reference degrades to a
+    bare content digest instead of a normal tag.
       - the image reference changes to something that looks like a bare
-        digest -> this is that known conflict; return True (needs a
-        stack restart).
-      - it changes to anything else (a normal-looking tag) -> the
-        recreate apparently completed cleanly despite the earlier
-        exception; return False.
+        digest -> this is that known conflict; return True.
+      - it changes to anything else (a normal-looking tag) -> the recreate
+        apparently completed cleanly despite the earlier exception; return
+        False.
       - it never changes at all within RECREATE_WAIT_TIMEOUT_SECONDS ->
         genuinely failed; raise rather than guess.
-
-    Waiting here means handle_perform_update -- a blocking service call
-    -- can now take up to RECREATE_WAIT_TIMEOUT_SECONDS to return on a
-    real failure (typically much faster on the known-conflict/success
-    paths, as soon as core's own portainer coordinator's next 60s poll
-    picks up the change). The webapp's own HTTP client timeout for this
-    call was raised to match -- see ha-portainer-sidecar's
-    ha_call_service_with_response."""
+    """
     if image_entity_id is None:
-        # No sensor.<name>_image entity to watch at all -- nothing to
-        # judge by. Fall back to the old assumption (this recovery path
-        # only ever existed for the known conflict), rather than failing
-        # an update that might well have actually succeeded.
         _LOGGER.warning(
             "%s.perform_update: recreate_container raised for '%s' but no "
             "sensor.<name>_image entity was found to watch -- assuming the "
@@ -322,9 +305,7 @@ async def _async_update_done(
     hass: HomeAssistant, entry: ConfigEntry, device_name: str, update_entity: str
 ) -> None:
     """Shared finishing logic for a completed update: a persistent_notification
-    plus a real phone push to every configured notify device. Used both by
-    the perform_update service and directly as its own service (for parity
-    with the old update_done.yaml script, in case anything else calls it)."""
+    plus a real phone push to every configured notify device."""
     notif_id = f"portainer_update_{update_entity.replace('.', '_')}"
     now_str = dt_util.now().strftime("%Y-%m-%d %H:%M")
 
@@ -349,7 +330,15 @@ async def _async_update_done(
             {
                 "title": "Update performed",
                 "message": f"{device_name} updated on {now_str}.",
-                "data": {"tag": f"portainer_update_done_{update_entity.replace('.', '_')}"},
+                "data": {
+                    "tag": f"portainer_update_done_{update_entity.replace('.', '_')}",
+                    # (1.3.0) every notification this integration sends now
+                    # carries an explicit no-op Dismiss action -- tapping
+                    # any action clears a notification from the tray, this
+                    # just gives an explicit "I saw this, nothing to do"
+                    # option alongside whatever real action(s) exist.
+                    "actions": [DISMISS_ACTION],
+                },
             },
         )
 
@@ -363,17 +352,18 @@ async def _async_notify_stack_restart_needed(
     actions_url: str,
 ) -> None:
     """The update itself went through, but recreate_container hit the
-    known network_mode:service:X daemon-conflict error (see the module
-    docstring, 1c.) -- so the container's image tag won't fully reconcile
-    until its stack is restarted. Notify instead of silently restarting:
-    a full stack restart bounces every other container in it too, and
-    that shouldn't happen without a tap.
+    known network_mode:service:X daemon-conflict error -- so the
+    container's image tag won't fully reconcile until its stack is
+    restarted.
 
-    handle_perform_update only calls this once it has already confirmed
-    switch_entity_id is not None (a standalone-container failure is
-    re-raised there instead, so it can't reach here reporting a false
-    success) -- the None-check below is just a defensive fallback for any
-    future/direct caller of this helper, not an expected path today."""
+    (1.3.0) This is now purely informational: no inline "Restart Stack
+    Now" action. The actual remediation lives on the dashboard's Trouble
+    tab (a stack can have several independent per-container update
+    notifications in flight at once, and a one-tap restart baked into any
+    one of them made that workflow feel disconnected from the others) --
+    tapping this notification's action opens the dashboard directly on
+    that tab via a `#trouble` URL fragment.
+    """
     if switch_entity_id is None:
         _LOGGER.warning(
             "%s.perform_update: asked to notify a stack-restart-needed case for '%s' "
@@ -390,7 +380,8 @@ async def _async_notify_stack_restart_needed(
     message = (
         f"{device_name} was updated on {now_str}, but its stack needs a restart "
         f"to finish cleanly (known Portainer limitation for containers sharing "
-        f"another container's network)."
+        f"another container's network). Restart it from the dashboard's Trouble "
+        f"tab whenever convenient."
     )
 
     await hass.services.async_call(
@@ -406,6 +397,7 @@ async def _async_notify_stack_restart_needed(
         },
     )
 
+    trouble_url = f"{actions_url}#trouble"
     for service in _notify_services_for_entry(hass, entry):
         domain, service_name = service.split(".", 1)
         await hass.services.async_call(
@@ -417,11 +409,8 @@ async def _async_notify_stack_restart_needed(
                 "data": {
                     "tag": f"portainer_update_done_{update_entity.replace('.', '_')}",
                     "actions": [
-                        {"action": "URI", "title": "Open Dashboard", "uri": actions_url},
-                        {
-                            "action": f"RESTART_STACK_{switch_entity_id}",
-                            "title": "Restart Stack Now",
-                        },
+                        {"action": "URI", "title": "Open Trouble Tab", "uri": trouble_url},
+                        DISMISS_ACTION,
                     ],
                 },
             },
@@ -429,7 +418,6 @@ async def _async_notify_stack_restart_needed(
 
 
 def _install_blueprints(hass: HomeAssistant) -> None:
-    """Copy the bundled blueprint files into HA's config dir. Blocking I/O -- run in the executor."""
     for src_rel, dest_rel in BLUEPRINT_FILES:
         src = BUNDLED_BLUEPRINTS_DIR / src_rel
         dest = Path(hass.config.path(dest_rel))
@@ -450,8 +438,6 @@ def _register_panel(hass: HomeAssistant, webapp_url: str) -> None:
             require_admin=False,
         )
     except ValueError:
-        # Already registered (e.g. a config entry reload) -- replace it so
-        # a changed webapp_url actually takes effect.
         frontend.async_remove_panel(hass, PANEL_PATH)
         frontend.async_register_built_in_panel(
             hass,
@@ -496,23 +482,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     async def handle_prune_images(call: ServiceCall) -> None:
         dangling = call.data.get("dangling", False)
         until_hours = call.data.get("until_hours")
+        requested_device_ids = call.data.get("device_ids")
 
-        # Discover every Portainer endpoint (host) device the same way the
-        # tracking sensors do -- walk every portainer-platform entity up to
-        # its root device -- so a newly-added host is picked up automatically
-        # and this never needs a static list of device_ids configured
-        # anywhere. See sensor.py's module docstring for why this reuses
-        # that logic instead of duplicating it.
         entity_reg = er.async_get(hass)
         device_reg = dr.async_get(hass)
 
-        root_ids: set[str] = set()
-        for entity_id in _portainer_entity_ids(entity_reg):
-            reg_entry = entity_reg.async_get(entity_id)
-            device_id = reg_entry.device_id if reg_entry else None
-            root_id = _walk_to_root(device_reg, device_id)
-            if root_id:
-                root_ids.add(root_id)
+        if requested_device_ids:
+            root_ids = {
+                rid for rid in (_walk_to_root(device_reg, d) for d in requested_device_ids) if rid
+            }
+        else:
+            root_ids = _discover_endpoint_devices(entity_reg, device_reg)
 
         if not root_ids:
             _LOGGER.warning(
@@ -541,6 +521,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                     host_name,
                     root_id,
                 )
+                continue
+
+            await _refresh_after_action(
+                hass,
+                [
+                    _endpoint_images_count_entity(entity_reg, root_id),
+                    _endpoint_reclaimable_entity(entity_reg, root_id),
+                ],
+            )
 
     if not hass.services.has_service(DOMAIN, SERVICE_PRUNE_IMAGES):
         hass.services.async_register(
@@ -548,6 +537,105 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             SERVICE_PRUNE_IMAGES,
             handle_prune_images,
             schema=SERVICE_PRUNE_IMAGES_SCHEMA,
+        )
+
+    async def handle_prune_volumes(call: ServiceCall) -> None:
+        """(1.3.0) Core has no `portainer.prune_volumes` service -- only a
+        `button.<endpoint>_volumes_prune` entity (ENDPOINT_BUTTONS in
+        core's button.py). button.press is the standard, publicly
+        supported way to trigger any button entity, so that's what this
+        wraps rather than reaching into core's internals for a service
+        that doesn't exist."""
+        requested_device_ids = call.data.get("device_ids")
+
+        entity_reg = er.async_get(hass)
+        device_reg = dr.async_get(hass)
+
+        if requested_device_ids:
+            root_ids = {
+                rid for rid in (_walk_to_root(device_reg, d) for d in requested_device_ids) if rid
+            }
+        else:
+            root_ids = _discover_endpoint_devices(entity_reg, device_reg)
+
+        if not root_ids:
+            _LOGGER.warning(
+                "%s.prune_volumes: no Portainer endpoint devices found -- nothing to prune",
+                DOMAIN,
+            )
+            return
+
+        for root_id in root_ids:
+            button_entity = _endpoint_volumes_prune_button(entity_reg, root_id)
+            if button_entity is None:
+                device = device_reg.async_get(root_id)
+                host_name = device.name_by_user or device.name if device else root_id
+                _LOGGER.warning(
+                    "%s.prune_volumes: no volumes_prune button entity found for host '%s' -- skipping",
+                    DOMAIN,
+                    host_name,
+                )
+                continue
+            try:
+                await hass.services.async_call(
+                    "button", "press", {"entity_id": button_entity}, blocking=True
+                )
+            except Exception:
+                device = device_reg.async_get(root_id)
+                host_name = device.name_by_user or device.name if device else root_id
+                _LOGGER.exception(
+                    "%s.prune_volumes: pressing %s failed for host '%s'",
+                    DOMAIN,
+                    button_entity,
+                    host_name,
+                )
+                continue
+
+            await _refresh_after_action(hass, [_endpoint_volume_usage_entity(entity_reg, root_id)])
+
+    if not hass.services.has_service(DOMAIN, SERVICE_PRUNE_VOLUMES):
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_PRUNE_VOLUMES,
+            handle_prune_volumes,
+            schema=SERVICE_PRUNE_VOLUMES_SCHEMA,
+        )
+
+    async def handle_reload_endpoint(call: ServiceCall) -> None:
+        """(1.3.0) Reloads the core `portainer` config entry that owns the
+        given device -- the same reload Settings -> Devices & Services ->
+        Portainer -> Reload performs. Core gives no service for this at
+        all, only that manual frontend button."""
+        device_id = call.data["device_id"]
+        device_reg = dr.async_get(hass)
+        device = device_reg.async_get(device_id)
+        if device is None:
+            raise ValueError(f"No device found with id '{device_id}'")
+
+        portainer_entry_id = None
+        for config_entry_id in device.config_entries:
+            candidate = hass.config_entries.async_get_entry(config_entry_id)
+            if candidate is not None and candidate.domain == "portainer":
+                portainer_entry_id = config_entry_id
+                break
+
+        if portainer_entry_id is None:
+            raise ValueError(f"Device '{device_id}' has no owning 'portainer' config entry")
+
+        _LOGGER.info(
+            "%s.reload_endpoint: reloading portainer config entry %s for device %s",
+            DOMAIN,
+            portainer_entry_id,
+            device_id,
+        )
+        await hass.config_entries.async_reload(portainer_entry_id)
+
+    if not hass.services.has_service(DOMAIN, SERVICE_RELOAD_ENDPOINT):
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_RELOAD_ENDPOINT,
+            handle_reload_endpoint,
+            schema=SERVICE_RELOAD_ENDPOINT_SCHEMA,
         )
 
     async def handle_perform_update(call: ServiceCall) -> dict:
@@ -563,44 +651,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         host_id = _walk_to_root(device_reg, container_device_id)
         host_name = _device_name(device_reg, host_id) or "unknown host"
         state = hass.states.get(update_entity)
-        # The CONTAINER's own device name, not the update entity's
-        # friendly_name -- core's portainer integration names update.*
-        # entities things like "trawl Image update available", which reads
-        # badly dropped straight into a push notification title ("Update
-        # performed: trawl Image update available (naples)", "Stack
-        # restart needed: trawl Image update available (naples)").
-        # PortainerUpdatesCoordinator._async_update_data in sensor.py
-        # already fixed this exact bug for the dashboard's item list; this
-        # is the same fix for the two native-service push notifications
-        # below, which read this update entity's friendly_name directly
-        # and were never touched by that earlier fix since they're a
-        # completely separate code path.
         container_name = _device_name(device_reg, container_device_id) or (
             state.attributes.get("friendly_name", update_entity) if state else update_entity
         )
         device_name = f"{container_name} ({host_name})"
 
-        # Containers whose network_mode is service:<other>/container:<other>
-        # (a VPN sidecar like gluetun) hit a confirmed, unfixed Portainer bug
-        # here: Docker's daemon rejects the create call over a
-        # hostname/network_mode conflict, even though the pull+recreate
-        # still actually completes -- reproduced identically via Portainer's
-        # own UI, independent of HA or this integration.
-        #
-        # An earlier version of this detected that case by matching the
-        # exception's text against the daemon's documented error wording.
-        # Confirmed in production that this cannot work: HA core's own
-        # portainer integration wraps every recreate_container failure,
-        # whatever the cause, into the same generic HomeAssistantError --
-        # the real Docker/Portainer error text never reaches this code at
-        # all. So this container's image reference is captured BEFORE the
-        # call, and on any exception for a container that IS part of a
-        # stack, judgment is deferred to _await_recreate_outcome, which
-        # watches what actually happens to that image reference instead of
-        # trusting the exception text -- see its own docstring for the
-        # full reasoning. A standalone-container failure has no stack to
-        # fall back on either way, so it's re-raised immediately, same as
-        # before this feature existed.
         switch_entity_id = _stack_switch_entity_id(hass, container_device_id)
         image_entity_id = _container_image_entity_id(hass, entity_reg, container_device_id)
         image_before_state = hass.states.get(image_entity_id) if image_entity_id else None
@@ -639,21 +694,21 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 hass, image_entity_id, image_before, update_entity
             )
 
-        # The recreate actually went through at this point (either cleanly,
-        # or via the swallowed known-conflict case above) -- but the core
-        # portainer integration's own update.* entity can keep reporting
-        # "update available" for hours regardless (home-assistant/core#182584,
-        # an open/unmerged upstream bug: its watcher cache is keyed to the
-        # container's old id). Tell our own updates-pending coordinator we
-        # just confirmed this one, so the dashboard/sidebar sensor stops
-        # showing it as pending immediately instead of waiting on a core fix
-        # that hasn't landed -- see RECENTLY_CONFIRMED_GRACE in sensor.py.
-        updates_coordinator = (
-            hass.data.get(DOMAIN, {}).get(entry.entry_id, {}).get("coordinators", {}).get("updates")
-        )
+        coordinators = hass.data.get(DOMAIN, {}).get(entry.entry_id, {}).get("coordinators", {})
+        updates_coordinator = coordinators.get("updates")
         if updates_coordinator is not None:
             updates_coordinator.mark_recently_updated(update_entity)
             await updates_coordinator.async_request_refresh()
+
+        # (1.3.0) The broadened Trouble sensor's stuck-container check is
+        # stateless (re-derived from live entity state, see sensor.py's
+        # _find_stuck_containers), so it doesn't strictly need to be told
+        # this happened -- but nudging its own refresh here means the
+        # Trouble tab reflects it on the next moment rather than waiting
+        # out its own 1-minute poll interval.
+        trouble_coordinator = coordinators.get("trouble")
+        if needs_stack_restart and trouble_coordinator is not None:
+            await trouble_coordinator.async_request_refresh()
 
         for service in _notify_services_for_entry(hass, entry):
             domain, service_name = service.split(".", 1)
@@ -671,12 +726,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         else:
             await _async_update_done(hass, entry, device_name, update_entity)
 
-        # Returned via HA's action-response-data feature (supports_response
-        # below) so a caller sitting at the webapp -- not just a phone
-        # getting the push above -- can react immediately: show its own
-        # "this stack needs a restart" prompt instead of waiting on a tap
-        # from a notification it never sees. The phone push still happens
-        # either way; this is additive, not a replacement for it.
         return {
             "needs_stack_restart": needs_stack_restart,
             "stack_switch_entity_id": switch_entity_id,
@@ -722,23 +771,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
 
     async def handle_hide_update_entities(call: ServiceCall) -> dict:
-        """Scan every Portainer update.* entity and hide any that aren't
-        already hidden -- closes the "hide its update.* entity" manual
-        step Setup steps used to call out as a per-new-container chore.
-        Reuses the same dynamic config-entry-domain scan as the tracking
-        sensors, so a newly-added host/container needs nothing configured
-        here either. Called by the blueprint's own startup sweep and its
-        entity_registry_updated trigger -- see the blueprint for both.
-
-        Only touches entities with hidden_by is None (never hidden at
-        all) -- an entity a user explicitly re-showed also has
-        hidden_by None, so this will re-hide it on the next sweep too.
-        That's intentional, not an oversight: this system's whole design
-        goal is that these entities' state belongs on the dashboard, not
-        in HA's own entity list, so "make sure they're hidden" is meant
-        as ongoing enforcement, not a one-time nudge. If that ever needs
-        to change, the fix is a per-entity opt-out, not removing the
-        enforcement."""
         entity_reg = er.async_get(hass)
         scanned = 0
         hidden = 0
@@ -775,17 +807,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     webapp_url = entry.data[CONF_WEBAPP_URL]
 
-    # The notification click-through URL is a bare RELATIVE path
-    # (/PANEL_PATH), not a full URL. The HA companion app treats a
-    # relative path as "navigate within the server I'm already connected
-    # to" -- so it always opens the sidebar panel in-app, with zero
-    # dependency on hass.config.external_url/internal_url (Settings ->
-    # System -> Network) and no need to know this instance's own address
-    # at all. Earlier versions tried to build an absolute URL from either
-    # HA's own configured network URL or the webapp's own URL -- both
-    # unnecessary detours around a feature the companion app already
-    # provides for exactly this case, and the second one is why tapping a
-    # notification opened an external browser instead of the app.
     actions_url = f"/{PANEL_PATH}"
     hass.data[DOMAIN][entry.entry_id]["actions_url"] = actions_url
 
@@ -804,6 +825,8 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if not hass.data[DOMAIN]:
             hass.services.async_remove(DOMAIN, SERVICE_REMOVE_DEVICE)
             hass.services.async_remove(DOMAIN, SERVICE_PRUNE_IMAGES)
+            hass.services.async_remove(DOMAIN, SERVICE_PRUNE_VOLUMES)
+            hass.services.async_remove(DOMAIN, SERVICE_RELOAD_ENDPOINT)
             hass.services.async_remove(DOMAIN, SERVICE_PERFORM_UPDATE)
             hass.services.async_remove(DOMAIN, SERVICE_UPDATE_DONE)
             hass.services.async_remove(DOMAIN, SERVICE_RESTART_STACK)
