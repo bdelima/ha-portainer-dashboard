@@ -517,6 +517,26 @@ async def _verify_github_url(hass: HomeAssistant, url: str) -> bool:
         return False
 
 
+# (1.3.2) "owner/repo", pulled back out of a resolved github.com
+# changelog URL -- the sidecar uses this to fetch structured release notes
+# via GitHub's own API and render them in-app, instead of linking out to
+# this URL, which was never usable from Home Assistant's companion app
+# (its embedded webview won't open a new window, and a same-window
+# fallback can only clobber this app's own panel -- see the sidecar's
+# README for the two failed attempts at working around that). A
+# hand-curated override that isn't a github.com URL (allowed, though every
+# current entry is one) just yields None here, and the sidecar falls back
+# to a plain external link for it, same as before this existed.
+_CHANGELOG_GITHUB_REPO_RE = re.compile(r"^https://github\.com/([^/]+/[^/]+?)(?:/releases.*)?$")
+
+
+def _github_repo_slug(changelog_url: str | None) -> str | None:
+    if not changelog_url:
+        return None
+    match = _CHANGELOG_GITHUB_REPO_RE.match(changelog_url)
+    return match.group(1) if match else None
+
+
 _REGISTRY_MANIFEST_ENDPOINTS: dict[str | None, tuple[str, str, str]] = {
     None: ("https://registry-1.docker.io", "https://auth.docker.io/token", "registry.docker.io"),
     "docker.io": ("https://registry-1.docker.io", "https://auth.docker.io/token", "registry.docker.io"),
@@ -765,6 +785,8 @@ class PortainerUpdatesCoordinator(DataUpdateCoordinator[list[dict]]):
                     "stack_device_id": stack_dev_id,
                     "stack_switch_entity_id": stack_switch_entity_id,
                     "changelog_url": changelog_url,
+                    # (1.3.2) See _github_repo_slug above.
+                    "changelog_repo": _github_repo_slug(changelog_url),
                     # (1.3.0) True when this container's stack has an open
                     # "needs a restart" Trouble item -- the webapp badges
                     # the stack's row with this so a fresh install doesn't
