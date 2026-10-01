@@ -1,1 +1,434 @@
-PLACEHOLDER
+alias: "Portainer Maintenance"
+blueprint:
+  name: "Portainer Maintenance"
+  description: >-
+    Every live Portainer automation -- notify on update available, handle
+    "Update now", handle "Dismiss", offer a stack restart when an update
+    needs one, startup recheck for missed updates, notify on container
+    trouble, notify on stale devices, keep update.* entities hidden --
+    merged into a single automation: multiple triggers, each tagged with
+    an id, dispatched via choose/trigger-id branching. One blueprint, one
+    automation, instead of one per behavior. Installed automatically by
+    the Portainer Maintenance integration -- this file is regenerated on
+    every integration load, so don't hand-edit this deployed copy.
+
+    Update-available detection triggers off sensor.portainer_updates_pending
+    rather than listening to state_changed system-wide: that sensor's own
+    coordinator already scans the entity registry for every update.*
+    entity under the Portainer integration every 5 minutes and publishes
+    the currently-on ones as its `items` attribute (see sensor.py). This
+    automation just diffs that list against its previous value to find
+    newly-appeared entries. That keeps "notify about ANY current or future
+    update entity" fully automatic with no per-entity selection, while
+    only ever listening to one explicit, cheap entity -- a raw
+    system-wide state_changed event trigger here previously caused two
+    HA lockups (self-retrigger / "Already running" log storms) because it
+    fired on every single state change in the house, not just Portainer's.
+    Tradeoff: update notifications now follow that sensor's 5-minute
+    refresh cadence instead of firing the instant an update.* entity
+    flips -- same cadence the old template-sensor design already used, so
+    not a regression.
+
+    Tradeoff accepted by merging: no more independent enable/disable or
+    separate trace/history per behavior in the HA UI -- disabling just one
+    (e.g. stale-device alerts) means editing this automation's choose
+    block, not flipping a toggle, and HA's trace view shows one shared run
+    history rather than six. See the design doc's "Blueprints" section.
+  domain: automation
+  input:
+    notify_device:
+      name: Notify device(s)
+      description: >-
+        The mobile_app device(s) all Portainer notifications go to. Select
+        more than one to push to multiple phones/tablets.
+      selector:
+        device:
+          filter:
+            integration: mobile_app
+          multiple: true
+
+    # (1.3.3) Per-category Android notification channels, replacing the
+    # single hardcoded `channel: alarm_stream` the "Notify on trouble"
+    # branch used to force unconditionally -- see
+    # github.com/bdelima/ha-portainer-dashboard/issues/1. The channel
+    # string IS the user-visible label Android shows under
+    # Settings > Apps > Home Assistant > Notifications (there's no
+    # separate internal-id/display-name split), so these defaults are
+    # friendly text, not snake_case. custom_value lets anyone split a
+    # category further (e.g. different channels per automation instance)
+    # without us inventing our own severity schema. No effect on iOS --
+    # see the "bypass Do Not Disturb" inputs' descriptions below and the
+    # design doc for the iOS equivalent (push.interruption-level), not
+    # implemented here since there are no iOS users to build it for yet.
+    updates_channel:
+      name: Updates Notification Channel
+      description: >-
+        Android notification channel for "update available" pushes,
+        including the startup recheck. Customize sound, importance, and
+        lock-screen visibility for this channel in your phone's own
+        notification settings after it's first created. No effect on iOS.
+      default: "Portainer Updates"
+      selector:
+        select:
+          options:
+            - "Portainer Updates"
+          custom_value: true
+    updates_bypass_dnd:
+      name: Updates -- Bypass Do Not Disturb
+      description: >-
+        When on, update-available pushes use Android's reserved
+        alarm_stream channel instead of the channel above. alarm_stream
+        plays at alarm volume and bypasses silent mode and Do Not
+        Disturb, the same way a phone alarm clock does -- it is a
+        channel shared phone-wide with any other app or automation that
+        also uses it, not exclusive to Portainer, and its reliability
+        varies by Android version/OEM. Off by default: a pending update
+        is rarely urgent enough to warrant this.
+      default: false
+      selector:
+        boolean: {}
+
+    trouble_channel:
+      name: Trouble Notification Channel
+      description: >-
+        Android notification channel for container/endpoint trouble
+        alerts. Customize sound, importance, and lock-screen visibility
+        for this channel in your phone's own notification settings after
+        it's first created. No effect on iOS.
+      default: "Portainer Trouble"
+      selector:
+        select:
+          options:
+            - "Portainer Trouble"
+            - "Portainer Critical"
+          custom_value: true
+    trouble_bypass_dnd:
+      name: Trouble -- Bypass Do Not Disturb
+      description: >-
+        When on, trouble pushes use Android's reserved alarm_stream
+        channel instead of the channel above. alarm_stream plays at
+        alarm volume and bypasses silent mode and Do Not Disturb, the
+        same way a phone alarm clock does -- it is a channel shared
+        phone-wide with any other app or automation that also uses it,
+        not exclusive to Portainer, and its reliability varies by
+        Android version/OEM. Off by default -- this used to be forced on
+        unconditionally for every trouble alert, which is what
+        github.com/bdelima/ha-portainer-dashboard/issues/1 reported
+        (a container going down at 6am sounding like an alarm clock).
+      default: false
+      selector:
+        boolean: {}
+
+    stale_channel:
+      name: Stale Devices Notification Channel
+      description: >-
+        Android notification channel for stale/gone-device alerts.
+        Customize sound, importance, and lock-screen visibility for this
+        channel in your phone's own notification settings after it's
+        first created. No effect on iOS.
+      default: "Portainer Stale Devices"
+      selector:
+        select:
+          options:
+            - "Portainer Stale Devices"
+          custom_value: true
+    stale_bypass_dnd:
+      name: Stale Devices -- Bypass Do Not Disturb
+      description: >-
+        When on, stale-device pushes use Android's reserved alarm_stream
+        channel instead of the channel above. Shared phone-wide, not
+        exclusive to Portainer. Off by default.
+      default: false
+      selector:
+        boolean: {}
+
+trigger:
+  - id: update_available
+    trigger: state
+    entity_id: sensor.portainer_updates_pending
+  - id: notification_action
+    trigger: event
+    event_type: mobile_app_notification_action
+  - id: startup_recheck
+    trigger: homeassistant
+    event: start
+  - id: container_trouble
+    trigger: state
+    entity_id: sensor.portainer_trouble
+  - id: stale_devices
+    trigger: state
+    entity_id: sensor.portainer_stale_devices
+  - id: entity_registry_updated
+    trigger: event
+    event_type: entity_registry_updated
+
+action:
+  - variables:
+      notify_devices: !input notify_device
+      notify_services: "{{ notify_devices | map('device_attr', 'name') | map('slugify') | map('regex_replace', '^', 'notify.mobile_app_') | list }}"
+      # (1.3.3) Each category resolves to the literal `alarm_stream`
+      # channel when its bypass-DND toggle is on, or the user's friendly
+      # channel name otherwise -- see the matching inputs above and
+      # issues#1 for why trouble no longer forces alarm_stream
+      # unconditionally.
+      updates_channel_name: !input updates_channel
+      updates_bypass_dnd: !input updates_bypass_dnd
+      updates_channel: "{{ 'alarm_stream' if updates_bypass_dnd else updates_channel_name }}"
+      trouble_channel_name: !input trouble_channel
+      trouble_bypass_dnd: !input trouble_bypass_dnd
+      trouble_channel: "{{ 'alarm_stream' if trouble_bypass_dnd else trouble_channel_name }}"
+      stale_channel_name: !input stale_channel
+      stale_bypass_dnd: !input stale_bypass_dnd
+      stale_channel: "{{ 'alarm_stream' if stale_bypass_dnd else stale_channel_name }}"
+  - choose:
+      # 1. Notify on newly-appeared update-available entries
+      #    (diffs sensor.portainer_updates_pending's `items` list --
+      #    see the blueprint description for why this isn't a raw
+      #    state_changed listener.)
+      - conditions:
+          - condition: trigger
+            id: update_available
+        sequence:
+          - variables:
+              old_items: "{{ trigger.from_state.attributes.get('items', []) if trigger.from_state else [] }}"
+              new_items: "{{ trigger.to_state.attributes.get('items', []) if trigger.to_state else [] }}"
+              old_entities: "{{ old_items | map(attribute='entity') | list }}"
+              newly_appeared: "{{ new_items | rejectattr('entity', 'in', old_entities) | list }}"
+          - repeat:
+              for_each: "{{ newly_appeared }}"
+              sequence:
+                - variables:
+                    new_item: "{{ repeat.item }}"
+                - repeat:
+                    for_each: "{{ notify_services }}"
+                    sequence:
+                      - action: "{{ repeat.item }}"
+                        data:
+                          title: "Update available"
+                          message: "{{ new_item.name }}"
+                          data:
+                            tag: "{{ new_item.entity }}"
+                            channel: "{{ updates_channel }}"
+                            actions:
+                              - action: "EXECUTE_UPDATE_{{ new_item.entity }}"
+                                title: "Update now"
+                              - action: "DISMISS_UPDATE_{{ new_item.entity }}"
+                                title: "Dismiss"
+
+      # 2. Handle "Update now"
+      - conditions:
+          - condition: trigger
+            id: notification_action
+          - condition: template
+            value_template: "{{ trigger.event.data.action.startswith('EXECUTE_UPDATE_') }}"
+        sequence:
+          - action: portainer_maintenance.perform_update
+            data:
+              update_entity: "{{ trigger.event.data.action.replace('EXECUTE_UPDATE_', '') }}"
+
+      # 3. Handle "Dismiss"
+      - conditions:
+          - condition: trigger
+            id: notification_action
+          - condition: template
+            value_template: "{{ trigger.event.data.action.startswith('DISMISS_UPDATE_') }}"
+        sequence:
+          - repeat:
+              for_each: "{{ notify_services }}"
+              sequence:
+                - action: "{{ repeat.item }}"
+                  data:
+                    message: "clear_notification"
+                    data:
+                      tag: "{{ trigger.event.data.action.replace('DISMISS_UPDATE_', '') }}"
+
+      # 4. (removed in 1.3.0) Used to handle a "Restart Stack Now" action
+      #    baked directly into the stack-restart-needed push. That
+      #    remediation now lives only on the dashboard's Trouble tab (a
+      #    stack can have several independent per-container update
+      #    notifications in flight at once, and a one-tap restart in any
+      #    one of them made that workflow feel disconnected from the
+      #    others) -- portainer_maintenance.restart_stack is still a plain
+      #    service, callable directly from the webapp or Developer Tools,
+      #    it's just no longer wired to a notification action here.
+
+      # 5. Startup recheck for missed updates
+      - conditions:
+          - condition: trigger
+            id: startup_recheck
+        sequence:
+          - wait_template: >
+              {{ integration_entities('portainer') | select('match', 'update\\.') | map('states') | reject('in', ['unknown','unavailable']) | list | length > 0 }}
+            timeout: "00:05:00"
+            continue_on_timeout: true
+          - delay:
+              seconds: 30
+          # Hide any Portainer update.* entity that isn't hidden yet --
+          # covers anything that existed before this feature shipped, or
+          # slipped through some other way. Ongoing coverage for entities
+          # created *after* startup is branch 8, below.
+          - action: portainer_maintenance.hide_update_entities
+          # Force our own coordinator to re-scan right now -- its own
+          # first-refresh-at-startup can land before the portainer
+          # integration's update.* entities are actually populated
+          # (manifest.json's dependency only guarantees setup ORDER, not
+          # that those entities have real states yet), which would
+          # otherwise leave this sensor stuck reporting 0 until its next
+          # 5-minute poll.
+          - action: homeassistant.update_entity
+            target:
+              entity_id: sensor.portainer_updates_pending
+          - condition: template
+            value_template: "{{ states('sensor.portainer_updates_pending') | int(0) > 0 }}"
+          - repeat:
+              for_each: "{{ notify_services }}"
+              sequence:
+                - action: "{{ repeat.item }}"
+                  data:
+                    title: "Updates available (recheck)"
+                    message: >
+                      {{ states('sensor.portainer_updates_pending') }} pending update{{ 's' if states('sensor.portainer_updates_pending') | int != 1 else '' }} found at startup. Tap to review.
+                    data:
+                      tag: "portainer_updates_pending"
+                      channel: "{{ updates_channel }}"
+                      clickAction: "{{ states('sensor.portainer_actions_url') }}"
+                      url: "{{ states('sensor.portainer_actions_url') }}"
+                      # (1.3.1) Every notification in this system is
+                      # meant to carry a no-op Dismiss -- tapping any
+                      # action clears it from the tray, so this just gives
+                      # an explicit "I saw this" option with nothing to
+                      # listen for anywhere. The __init__.py-side pushes
+                      # (update performed, stack restart needed) picked
+                      # this up in 1.3.0; this blueprint-issued push was
+                      # missed at the time, fixed here in 1.3.1.
+                      actions:
+                        - action: "dismiss"
+                          title: "Dismiss"
+
+      # 6. Notify on trouble -- (1.3.0) sensor.portainer_trouble broadened
+      #    past individual containers to also cover an endpoint that's
+      #    dropped its connection entirely and a container stuck on the
+      #    known network_mode:service:X daemon conflict, so this wording
+      #    stays generic rather than naming "container" specifically.
+      #    (1.3.3) No longer forces channel: alarm_stream / priority:
+      #    high / ttl: 0 unconditionally -- see issues#1. Now resolves to
+      #    the user's chosen Trouble channel, or alarm_stream specifically
+      #    when they've opted into the Trouble bypass-DND toggle above.
+      #    (1.3.11) clickAction/url hash updated from #trouble to
+      #    #needs-remediation to match the sidecar webapp's renamed tab --
+      #    see ha-portainer-sidecar's app.js tabFromHash(). The sensor
+      #    entity (sensor.portainer_trouble) and this branch's trigger id
+      #    (container_trouble) are unchanged; only the URL fragment the
+      #    notification deep-links to moved.
+      - conditions:
+          - condition: trigger
+            id: container_trouble
+          - condition: template
+            value_template: >
+              {{ trigger.to_state.state | int(0) > (trigger.from_state.state | int(0) if trigger.from_state else 0) }}
+        sequence:
+          - repeat:
+              for_each: "{{ notify_services }}"
+              sequence:
+                - action: "{{ repeat.item }}"
+                  data:
+                    title: "Portainer trouble"
+                    message: >
+                      {{ trigger.to_state.state }} item{{ 's' if trigger.to_state.state | int != 1 else '' }} need attention. Tap to review.
+                    data:
+                      tag: "portainer_trouble"
+                      channel: "{{ trouble_channel }}"
+                      clickAction: "{{ states('sensor.portainer_actions_url') }}#needs-remediation"
+                      url: "{{ states('sensor.portainer_actions_url') }}#needs-remediation"
+                      # (1.3.1) See the matching note on branch 5 above.
+                      actions:
+                        - action: "dismiss"
+                          title: "Dismiss"
+
+      # 7. Report stale Portainer devices
+      - conditions:
+          - condition: trigger
+            id: stale_devices
+          - condition: template
+            value_template: >
+              {{ trigger.to_state.state | int(0) > (trigger.from_state.state | int(0) if trigger.from_state else 0) }}
+        sequence:
+          - repeat:
+              for_each: "{{ notify_services }}"
+              sequence:
+                - action: "{{ repeat.item }}"
+                  data:
+                    title: "Stale Portainer devices"
+                    message: >
+                      {{ trigger.to_state.state }} device{{ 's' if trigger.to_state.state | int != 1 else '' }} look gone. Tap to review.
+                    data:
+                      tag: "portainer_stale_devices"
+                      channel: "{{ stale_channel }}"
+                      clickAction: "{{ states('sensor.portainer_actions_url') }}"
+                      url: "{{ states('sensor.portainer_actions_url') }}"
+                      # (1.3.1) See the matching note on branch 5 above.
+                      actions:
+                        - action: "dismiss"
+                          title: "Dismiss"
+
+      # 8. Hide a newly-registered update entity
+      #    Ongoing counterpart to branch 5's startup sweep -- fires the
+      #    moment a new container's update.* entity is registered (rather
+      #    than waiting for the next HA restart), so a container added at
+      #    any time gets its update entity hidden automatically. Filters
+      #    entity_registry_updated (which fires for every entity in the
+      #    house, any integration) down to just a newly-created update.*
+      #    entity belonging to the portainer platform, via the same
+      #    config_entry_id()/config_entry_attr() dynamic-scoping pattern
+      #    used everywhere else in this design. Re-scans everything rather
+      #    than hiding just the one entity -- cheap, and self-healing
+      #    against anything else that slipped through.
+      - conditions:
+          - condition: trigger
+            id: entity_registry_updated
+          - condition: template
+            value_template: >
+              {{ trigger.event.data.action == 'create'
+                 and trigger.event.data.entity_id.startswith('update.')
+                 and config_entry_attr(config_entry_id(trigger.event.data.entity_id), 'domain') == 'portainer' }}
+        sequence:
+          - action: portainer_maintenance.hide_update_entities
+
+  # 9. Sidebar notification-bell badge: HA's own persistent_notification
+  # count (the bell icon, top of the sidebar) is native and needs no
+  # third-party plugin, unlike a badge on the panel item itself, which
+  # HA's frontend doesn't expose to custom integrations at all. Recomputed
+  # after every run regardless of which trigger fired -- cheap (three
+  # state reads, one service call) and keeps this always correct off the
+  # sensors' current values rather than needing to track deltas per
+  # branch above.
+  - variables:
+      total_action_items: >-
+        {{ (states('sensor.portainer_updates_pending') | int(0))
+           + (states('sensor.portainer_trouble') | int(0))
+           + (states('sensor.portainer_stale_devices') | int(0))
+           + (states('sensor.portainer_cleanup') | int(0)) }}
+  - if:
+      - condition: template
+        value_template: "{{ total_action_items > 0 }}"
+    then:
+      - action: persistent_notification.create
+        data:
+          notification_id: portainer_maintenance_action_items
+          title: "Portainer Maintenance"
+          message: |-
+            {%- set updates_n = states('sensor.portainer_updates_pending') | int(0) -%}
+            {%- set stale_n = states('sensor.portainer_stale_devices') | int(0) -%}
+            {%- set trouble_n = states('sensor.portainer_trouble') | int(0) -%}
+            {%- set cleanup_n = states('sensor.portainer_cleanup') | int(0) -%}
+            {%- set parts = [] -%}
+            {%- if updates_n > 0 -%}{%- set parts = parts + [updates_n ~ ' image update' ~ ('s' if updates_n != 1 else '')] -%}{%- endif -%}
+            {%- if trouble_n > 0 -%}{%- set parts = parts + [trouble_n ~ ' item' ~ ('s' if trouble_n != 1 else '') ~ ' in trouble'] -%}{%- endif -%}
+            {%- if stale_n > 0 -%}{%- set parts = parts + [stale_n ~ ' stale device' ~ ('s' if stale_n != 1 else '')] -%}{%- endif -%}
+            {%- if cleanup_n > 0 -%}{%- set parts = parts + [cleanup_n ~ ' image' ~ ('s' if cleanup_n != 1 else '') ~ ' to clean up'] -%}{%- endif -%}
+            {%- set summary = parts[0] if parts | length == 1 else (parts[0] ~ ' and ' ~ parts[1]) if parts | length == 2 else (parts[:-1] | join(', ') ~ ', and ' ~ parts[-1]) -%}
+            Portainer is reporting {{ summary }}. [Open dashboard](/portainer-actions) to review.
+    else:
+      - action: persistent_notification.dismiss
+        data:
+          notification_id: portainer_maintenance_action_items
