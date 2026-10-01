@@ -47,6 +47,101 @@ blueprint:
             integration: mobile_app
           multiple: true
 
+    # (1.3.3) Per-category Android notification channels, replacing the
+    # single hardcoded `channel: alarm_stream` the "Notify on trouble"
+    # branch used to force unconditionally -- see
+    # github.com/bdelima/ha-portainer-dashboard/issues/1. The channel
+    # string IS the user-visible label Android shows under
+    # Settings > Apps > Home Assistant > Notifications (there's no
+    # separate internal-id/display-name split), so these defaults are
+    # friendly text, not snake_case. custom_value lets anyone split a
+    # category further (e.g. different channels per automation instance)
+    # without us inventing our own severity schema. No effect on iOS --
+    # see the "bypass Do Not Disturb" inputs' descriptions below and the
+    # design doc for the iOS equivalent (push.interruption-level), not
+    # implemented here since there are no iOS users to build it for yet.
+    updates_channel:
+      name: Updates Notification Channel
+      description: >-
+        Android notification channel for "update available" pushes,
+        including the startup recheck. Customize sound, importance, and
+        lock-screen visibility for this channel in your phone's own
+        notification settings after it's first created. No effect on iOS.
+      default: "Portainer Updates"
+      selector:
+        select:
+          options:
+            - "Portainer Updates"
+          custom_value: true
+    updates_bypass_dnd:
+      name: Updates -- Bypass Do Not Disturb
+      description: >-
+        When on, update-available pushes use Android's reserved
+        alarm_stream channel instead of the channel above. alarm_stream
+        plays at alarm volume and bypasses silent mode and Do Not
+        Disturb, the same way a phone alarm clock does -- it is a
+        channel shared phone-wide with any other app or automation that
+        also uses it, not exclusive to Portainer, and its reliability
+        varies by Android version/OEM. Off by default: a pending update
+        is rarely urgent enough to warrant this.
+      default: false
+      selector:
+        boolean: {}
+
+    trouble_channel:
+      name: Trouble Notification Channel
+      description: >-
+        Android notification channel for container/endpoint trouble
+        alerts. Customize sound, importance, and lock-screen visibility
+        for this channel in your phone's own notification settings after
+        it's first created. No effect on iOS.
+      default: "Portainer Trouble"
+      selector:
+        select:
+          options:
+            - "Portainer Trouble"
+            - "Portainer Critical"
+          custom_value: true
+    trouble_bypass_dnd:
+      name: Trouble -- Bypass Do Not Disturb
+      description: >-
+        When on, trouble pushes use Android's reserved alarm_stream
+        channel instead of the channel above. alarm_stream plays at
+        alarm volume and bypasses silent mode and Do Not Disturb, the
+        same way a phone alarm clock does -- it is a channel shared
+        phone-wide with any other app or automation that also uses it,
+        not exclusive to Portainer, and its reliability varies by
+        Android version/OEM. Off by default -- this used to be forced on
+        unconditionally for every trouble alert, which is what
+        github.com/bdelima/ha-portainer-dashboard/issues/1 reported
+        (a container going down at 6am sounding like an alarm clock).
+      default: false
+      selector:
+        boolean: {}
+
+    stale_channel:
+      name: Stale Devices Notification Channel
+      description: >-
+        Android notification channel for stale/gone-device alerts.
+        Customize sound, importance, and lock-screen visibility for this
+        channel in your phone's own notification settings after it's
+        first created. No effect on iOS.
+      default: "Portainer Stale Devices"
+      selector:
+        select:
+          options:
+            - "Portainer Stale Devices"
+          custom_value: true
+    stale_bypass_dnd:
+      name: Stale Devices -- Bypass Do Not Disturb
+      description: >-
+        When on, stale-device pushes use Android's reserved alarm_stream
+        channel instead of the channel above. Shared phone-wide, not
+        exclusive to Portainer. Off by default.
+      default: false
+      selector:
+        boolean: {}
+
 trigger:
   - id: update_available
     trigger: state
@@ -71,6 +166,20 @@ action:
   - variables:
       notify_devices: !input notify_device
       notify_services: "{{ notify_devices | map('device_attr', 'name') | map('slugify') | map('regex_replace', '^', 'notify.mobile_app_') | list }}"
+      # (1.3.3) Each category resolves to the literal `alarm_stream`
+      # channel when its bypass-DND toggle is on, or the user's friendly
+      # channel name otherwise -- see the matching inputs above and
+      # issues#1 for why trouble no longer forces alarm_stream
+      # unconditionally.
+      updates_channel_name: !input updates_channel
+      updates_bypass_dnd: !input updates_bypass_dnd
+      updates_channel: "{{ 'alarm_stream' if updates_bypass_dnd else updates_channel_name }}"
+      trouble_channel_name: !input trouble_channel
+      trouble_bypass_dnd: !input trouble_bypass_dnd
+      trouble_channel: "{{ 'alarm_stream' if trouble_bypass_dnd else trouble_channel_name }}"
+      stale_channel_name: !input stale_channel
+      stale_bypass_dnd: !input stale_bypass_dnd
+      stale_channel: "{{ 'alarm_stream' if stale_bypass_dnd else stale_channel_name }}"
   - choose:
       # 1. Notify on newly-appeared update-available entries
       #    (diffs sensor.portainer_updates_pending's `items` list --
@@ -99,6 +208,7 @@ action:
                           message: "{{ new_item.name }}"
                           data:
                             tag: "{{ new_item.entity }}"
+                            channel: "{{ updates_channel }}"
                             actions:
                               - action: "EXECUTE_UPDATE_{{ new_item.entity }}"
                                 title: "Update now"
@@ -180,6 +290,7 @@ action:
                       {{ states('sensor.portainer_updates_pending') }} pending update{{ 's' if states('sensor.portainer_updates_pending') | int != 1 else '' }} found at startup. Tap to review.
                     data:
                       tag: "portainer_updates_pending"
+                      channel: "{{ updates_channel }}"
                       clickAction: "{{ states('sensor.portainer_actions_url') }}"
                       url: "{{ states('sensor.portainer_actions_url') }}"
                       # (1.3.1) Every notification in this system is
@@ -189,7 +300,7 @@ action:
                       # listen for anywhere. The __init__.py-side pushes
                       # (update performed, stack restart needed) picked
                       # this up in 1.3.0; this blueprint-issued push was
-                      # missed at the time.
+                      # missed at the time, fixed here in 1.3.1.
                       actions:
                         - action: "dismiss"
                           title: "Dismiss"
@@ -199,6 +310,10 @@ action:
       #    dropped its connection entirely and a container stuck on the
       #    known network_mode:service:X daemon conflict, so this wording
       #    stays generic rather than naming "container" specifically.
+      #    (1.3.3) No longer forces channel: alarm_stream / priority:
+      #    high / ttl: 0 unconditionally -- see issues#1. Now resolves to
+      #    the user's chosen Trouble channel, or alarm_stream specifically
+      #    when they've opted into the Trouble bypass-DND toggle above.
       - conditions:
           - condition: trigger
             id: container_trouble
@@ -216,9 +331,7 @@ action:
                       {{ trigger.to_state.state }} item{{ 's' if trigger.to_state.state | int != 1 else '' }} need attention. Tap to review.
                     data:
                       tag: "portainer_trouble"
-                      priority: high
-                      ttl: 0
-                      channel: alarm_stream
+                      channel: "{{ trouble_channel }}"
                       clickAction: "{{ states('sensor.portainer_actions_url') }}#trouble"
                       url: "{{ states('sensor.portainer_actions_url') }}#trouble"
                       # (1.3.1) See the matching note on branch 5 above.
@@ -244,6 +357,7 @@ action:
                       {{ trigger.to_state.state }} device{{ 's' if trigger.to_state.state | int != 1 else '' }} look gone. Tap to review.
                     data:
                       tag: "portainer_stale_devices"
+                      channel: "{{ stale_channel }}"
                       clickAction: "{{ states('sensor.portainer_actions_url') }}"
                       url: "{{ states('sensor.portainer_actions_url') }}"
                       # (1.3.1) See the matching note on branch 5 above.
