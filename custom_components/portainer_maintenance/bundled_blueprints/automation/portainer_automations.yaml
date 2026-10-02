@@ -5,12 +5,13 @@ blueprint:
     Every live Portainer automation -- notify on update available, handle
     "Update now", handle "Dismiss", offer a stack restart when an update
     needs one, startup recheck for missed updates, notify on container
-    trouble, notify on stale devices, keep update.* entities hidden --
-    merged into a single automation: multiple triggers, each tagged with
-    an id, dispatched via choose/trigger-id branching. One blueprint, one
-    automation, instead of one per behavior. Installed automatically by
-    the Portainer Maintenance integration -- this file is regenerated on
-    every integration load, so don't hand-edit this deployed copy.
+    trouble, notify on stale devices, notify on cleanup (dangling images
+    to reclaim), keep update.* entities hidden -- merged into a single
+    automation: multiple triggers, each tagged with an id, dispatched via
+    choose/trigger-id branching. One blueprint, one automation, instead of
+    one per behavior. Installed automatically by the Portainer Maintenance
+    integration -- this file is regenerated on every integration load, so
+    don't hand-edit this deployed copy.
 
     Update-available detection triggers off sensor.portainer_updates_pending
     rather than listening to state_changed system-wide: that sensor's own
@@ -142,6 +143,36 @@ blueprint:
       selector:
         boolean: {}
 
+    # (new) sensor.portainer_cleanup already feeds the sidebar bell badge
+    # (branch 9 below) and backs the dashboard's Cleanup tab, but had no
+    # push-notification branch of its own -- unlike Updates/Trouble/Stale,
+    # a rising dangling-image count never actually pushed to a phone.
+    # Mirrors the Stale Devices inputs above rather than inventing a new
+    # shape.
+    cleanup_channel:
+      name: Cleanup Notification Channel
+      description: >-
+        Android notification channel for "images to clean up" pushes.
+        Customize sound, importance, and lock-screen visibility for this
+        channel in your phone's own notification settings after it's
+        first created. No effect on iOS.
+      default: "Portainer Cleanup"
+      selector:
+        select:
+          options:
+            - "Portainer Cleanup"
+          custom_value: true
+    cleanup_bypass_dnd:
+      name: Cleanup -- Bypass Do Not Disturb
+      description: >-
+        When on, cleanup pushes use Android's reserved alarm_stream
+        channel instead of the channel above. Shared phone-wide, not
+        exclusive to Portainer. Off by default -- a dangling-image count
+        is never urgent enough to warrant this.
+      default: false
+      selector:
+        boolean: {}
+
 trigger:
   - id: update_available
     trigger: state
@@ -158,6 +189,9 @@ trigger:
   - id: stale_devices
     trigger: state
     entity_id: sensor.portainer_stale_devices
+  - id: cleanup_images
+    trigger: state
+    entity_id: sensor.portainer_cleanup
   - id: entity_registry_updated
     trigger: event
     event_type: entity_registry_updated
@@ -180,6 +214,9 @@ action:
       stale_channel_name: !input stale_channel
       stale_bypass_dnd: !input stale_bypass_dnd
       stale_channel: "{{ 'alarm_stream' if stale_bypass_dnd else stale_channel_name }}"
+      cleanup_channel_name: !input cleanup_channel
+      cleanup_bypass_dnd: !input cleanup_bypass_dnd
+      cleanup_channel: "{{ 'alarm_stream' if cleanup_bypass_dnd else cleanup_channel_name }}"
   - choose:
       # 1. Notify on newly-appeared update-available entries
       #    (diffs sensor.portainer_updates_pending's `items` list --
@@ -365,7 +402,39 @@ action:
                         - action: "dismiss"
                           title: "Dismiss"
 
-      # 8. Hide a newly-registered update entity
+      # 8. (new) Notify on cleanup -- sensor.portainer_cleanup is a
+      #    running sum of each endpoint's unused-image estimate (see
+      #    PortainerCleanupCoordinator in sensor.py), so this fires the
+      #    same way branch 7 does: only on an increase, never on the
+      #    count just dropping after someone cleans up. Links to the
+      #    Cleanup tab specifically (#cleanup), same pattern as branch 6's
+      #    #trouble link.
+      - conditions:
+          - condition: trigger
+            id: cleanup_images
+          - condition: template
+            value_template: >
+              {{ trigger.to_state.state | int(0) > (trigger.from_state.state | int(0) if trigger.from_state else 0) }}
+        sequence:
+          - repeat:
+              for_each: "{{ notify_services }}"
+              sequence:
+                - action: "{{ repeat.item }}"
+                  data:
+                    title: "Portainer cleanup"
+                    message: >
+                      {{ trigger.to_state.state }} image{{ 's' if trigger.to_state.state | int != 1 else '' }} to clean up. Tap to review.
+                    data:
+                      tag: "portainer_cleanup"
+                      channel: "{{ cleanup_channel }}"
+                      clickAction: "{{ states('sensor.portainer_actions_url') }}#cleanup"
+                      url: "{{ states('sensor.portainer_actions_url') }}#cleanup"
+                      # (1.3.1) See the matching note on branch 5 above.
+                      actions:
+                        - action: "dismiss"
+                          title: "Dismiss"
+
+      # 9. Hide a newly-registered update entity
       #    Ongoing counterpart to branch 5's startup sweep -- fires the
       #    moment a new container's update.* entity is registered (rather
       #    than waiting for the next HA restart), so a container added at
@@ -388,7 +457,7 @@ action:
         sequence:
           - action: portainer_maintenance.hide_update_entities
 
-  # 9. Sidebar notification-bell badge: HA's own persistent_notification
+  # 10. Sidebar notification-bell badge: HA's own persistent_notification
   # count (the bell icon, top of the sidebar) is native and needs no
   # third-party plugin, unlike a badge on the panel item itself, which
   # HA's frontend doesn't expose to custom integrations at all. Recomputed
