@@ -414,7 +414,7 @@ action:
       #    same way branch 7 does: only on an increase, never on the
       #    count just dropping after someone cleans up. Links to the
       #    Cleanup tab specifically (#cleanup), same pattern as branch 6's
-      #    #trouble link.
+      #    #needs-remediation link (#trouble prior to 1.3.5).
       - conditions:
           - condition: trigger
             id: cleanup_images
