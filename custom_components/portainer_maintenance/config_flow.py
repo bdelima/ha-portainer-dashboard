@@ -66,15 +66,19 @@ class PortainerMaintenanceConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             self._abort_if_unique_id_configured()
 
             # There's no supported way for a config flow to hand the browser
-            # off to a different page on completion (checked: no query param
-            # on the automation editor, and the my.home-assistant.io
-            # blueprint_import redirect is for importing a blueprint from a
-            # URL, not creating an automation from one already installed
-            # locally, which is what we do). A one-time persistent
-            # notification with a direct link is the closest available
-            # nudge -- one tap to the right list instead of hunting through
-            # Settings, even though picking "Use Blueprint" and finding ours
-            # by name is still manual after that.
+            # off to the automation editor on completion: the frontend passes
+            # "create from this blueprint" to the editor through in-memory
+            # state (showAutomationEditor()'s initialAutomationEditorData,
+            # see src/data/automation.ts), not a URL or query param, so no
+            # link can open that screen directly. The closest available
+            # nudge is a one-time persistent notification linking to the
+            # Blueprints page, where clicking the "Portainer Maintenance"
+            # row opens the editor already pre-filled with this blueprint.
+            #
+            # Route note: the frontend's config routes are singular
+            # (/config/blueprint, /config/automation). An earlier version of
+            # this link used the plural /config/automations/dashboard, which
+            # isn't a route and opened a blank page.
             await self.hass.services.async_call(
                 "persistent_notification",
                 "create",
@@ -84,9 +88,8 @@ class PortainerMaintenanceConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     "message": (
                         "Setup is complete. To get update/trouble/stale-device "
                         "notifications, create an automation from the bundled "
-                        "blueprint: [Automations](/config/automations/dashboard) "
-                        "→ **Add Automation** → **Use Blueprint** → "
-                        '"Portainer Maintenance".'
+                        "blueprint: open [Blueprints](/config/blueprint/dashboard) "
+                        'and click **"Portainer Maintenance"**.'
                     ),
                 },
             )
