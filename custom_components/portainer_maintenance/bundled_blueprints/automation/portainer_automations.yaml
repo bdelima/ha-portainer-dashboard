@@ -351,6 +351,12 @@ action:
       #    high / ttl: 0 unconditionally -- see issues#1. Now resolves to
       #    the user's chosen Trouble channel, or alarm_stream specifically
       #    when they've opted into the Trouble bypass-DND toggle above.
+      #    (1.3.11) clickAction/url hash updated from #trouble to
+      #    #needs-remediation to match the sidecar webapp's renamed tab --
+      #    see ha-portainer-sidecar's app.js tabFromHash(). The sensor
+      #    entity (sensor.portainer_trouble) and this branch's trigger id
+      #    (container_trouble) are unchanged; only the URL fragment the
+      #    notification deep-links to moved.
       - conditions:
           - condition: trigger
             id: container_trouble
@@ -369,8 +375,8 @@ action:
                     data:
                       tag: "portainer_trouble"
                       channel: "{{ trouble_channel }}"
-                      clickAction: "{{ states('sensor.portainer_actions_url') }}#trouble"
-                      url: "{{ states('sensor.portainer_actions_url') }}#trouble"
+                      clickAction: "{{ states('sensor.portainer_actions_url') }}#needs-remediation"
+                      url: "{{ states('sensor.portainer_actions_url') }}#needs-remediation"
                       # (1.3.1) See the matching note on branch 5 above.
                       actions:
                         - action: "dismiss"
