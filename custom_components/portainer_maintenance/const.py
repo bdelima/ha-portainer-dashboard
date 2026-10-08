@@ -3,6 +3,7 @@
 DOMAIN = "portainer_maintenance"
 CONF_WEBAPP_URL = "webapp_url"
 CONF_NOTIFY_DEVICES = "notify_devices"
+CONF_ADMIN_ONLY = "admin_only"
 
 PANEL_PATH = "portainer-actions"
 PANEL_TITLE = "Portainer Maintenance"
