@@ -63,10 +63,10 @@ On setup this integration:
 1g. Registers `portainer_maintenance.dismiss_trouble_item` -- hides a
    Needs Remediation item the user can't act on from the dashboard (see
    dismissals.py for how long a dismissal lasts). `perform_update` also
-   refuses Portainer's own container: recreating it from inside Portainer
-   stops it before the replacement starts (see sensor.py's
-   `_is_portainer_server_container`); its update is listed on the trouble
-   sensor instead.
+   refuses Portainer's own containers, the server and the agent: recreating
+   one from inside Portainer stops it before the replacement starts (see
+   sensor.py's `_portainer_component`); their updates are listed on the
+   trouble sensor instead.
 
 2. Installs its bundled automation blueprint into HA's config dir
    automatically.
@@ -112,8 +112,8 @@ from .sensor import (
     _endpoint_reclaimable_entity,
     _endpoint_volume_usage_entity,
     _endpoint_volumes_prune_button,
-    _is_portainer_server_container,
     _looks_like_bare_digest,
+    _portainer_component,
     _portainer_entity_ids,
     _portainer_self_update_detail,
     _stack_info,
@@ -711,12 +711,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
         device_name = f"{container_name} ({host_name})"
 
-        # Portainer can't recreate itself (see sensor.py's
-        # _is_portainer_server_container): refuse rather than leave it
+        # Portainer's server and agent can't recreate themselves (see
+        # sensor.py's _portainer_component): refuse rather than leave them
         # stopped. Applies to every caller -- the dashboard, the blueprint's
         # notification action, scripts.
-        if _is_portainer_server_container(hass, entity_reg, container_device_id):
-            raise HomeAssistantError(_portainer_self_update_detail(container_name, host_name))
+        portainer_component = _portainer_component(hass, entity_reg, container_device_id)
+        if portainer_component is not None:
+            raise HomeAssistantError(
+                _portainer_self_update_detail(container_name, host_name, portainer_component)
+            )
 
         switch_entity_id = _stack_switch_entity_id(hass, container_device_id)
         image_entity_id = _container_image_entity_id(hass, entity_reg, container_device_id)
