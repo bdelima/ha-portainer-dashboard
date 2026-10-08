@@ -940,6 +940,12 @@ class PortainerTroubleCoordinator(DataUpdateCoordinator[list[dict]]):
     def __init__(self, hass: HomeAssistant, dismissals: DismissalStore | None = None) -> None:
         super().__init__(hass, _LOGGER, name=SENSOR_TROUBLE, update_interval=timedelta(minutes=1))
         self._dismissals = dismissals
+        # Items the last update left out because they are dismissed, so
+        # sensor.portainer_trouble can show what is currently hidden (its
+        # `dismissed_items` attribute). A dismissed item whose condition has
+        # since cleared is not in this list: it only lists what would
+        # otherwise be showing right now.
+        self.suppressed: list[dict] = []
 
     async def _async_update_data(self) -> list[dict]:
         entity_reg = er.async_get(self.hass)
@@ -1090,11 +1096,26 @@ class PortainerTroubleCoordinator(DataUpdateCoordinator[list[dict]]):
                 }
             )
 
+        suppressed: list[dict] = []
         if self._dismissals is not None:
-            found = [
-                i for i in found
-                if not (i.get("dismiss_key") and self._dismissals.is_dismissed(i["dismiss_key"]))
-            ]
+            visible: list[dict] = []
+            for i in found:
+                key = i.get("dismiss_key")
+                if key and self._dismissals.is_dismissed(key):
+                    stamp = self._dismissals.dismissed_at(key)
+                    suppressed.append(
+                        {
+                            "kind": i.get("kind"),
+                            "name": i.get("name"),
+                            "host": i.get("host"),
+                            "dismiss_key": key,
+                            "dismissed_at": stamp.isoformat() if stamp else None,
+                        }
+                    )
+                else:
+                    visible.append(i)
+            found = visible
+        self.suppressed = suppressed
         return found
 
 
@@ -1256,7 +1277,12 @@ class _PortainerListSensor(CoordinatorEntity[DataUpdateCoordinator], SensorEntit
 
     @property
     def extra_state_attributes(self) -> dict:
-        return {"items": self.coordinator.data or []}
+        attrs: dict = {"items": self.coordinator.data or []}
+        # Only the trouble coordinator has anything suppressed to report.
+        suppressed = getattr(self.coordinator, "suppressed", None)
+        if suppressed is not None:
+            attrs["dismissed_items"] = suppressed
+        return attrs
 
 
 class _PortainerCleanupSensor(CoordinatorEntity[DataUpdateCoordinator], SensorEntity):
