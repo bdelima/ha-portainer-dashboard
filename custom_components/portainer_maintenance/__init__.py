@@ -68,6 +68,12 @@ On setup this integration:
    sensor.py's `_portainer_component`); their updates are listed on the
    trouble sensor instead.
 
+1h. Registers `portainer_maintenance.update_portainer` -- updates Portainer's
+   own server or agent by starting Portainer's `portainer-updater` helper
+   container on the same host (see `handle_update_portainer`), the one
+   route that does not depend on the container being updated. It is only
+   ever started on request; nothing here calls it automatically.
+
 2. Installs its bundled automation blueprint into HA's config dir
    automatically.
 
@@ -88,6 +94,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import shutil
+import time
+import uuid
+from datetime import timedelta
 from pathlib import Path
 
 import voluptuous as vol
@@ -180,6 +189,30 @@ SERVICE_HIDE_UPDATE_ENTITIES_SCHEMA = vol.Schema({})
 SERVICE_DISMISS_TROUBLE_ITEM = "dismiss_trouble_item"
 SERVICE_DISMISS_TROUBLE_ITEM_SCHEMA = vol.Schema({vol.Required("dismiss_key"): cv.string})
 
+SERVICE_UPDATE_PORTAINER = "update_portainer"
+SERVICE_UPDATE_PORTAINER_SCHEMA = vol.Schema(
+    {
+        vol.Required("update_entity"): cv.entity_id,
+        vol.Optional("dry_run", default=False): cv.boolean,
+    }
+)
+
+# Core Home Assistant's own Portainer integration (not this one).
+CORE_PORTAINER_DOMAIN = "portainer"
+
+# Portainer's helper image for updating Portainer in place. Its source is
+# github.com/portainer/portainer-updater; the command lines below are the
+# ones its README documents ("portainer --image=<ref>" for the server,
+# "agent <schedule-id> <image>" for the agent).
+PORTAINER_UPDATER_IMAGE = "portainer/portainer-updater:latest"
+PORTAINER_UPDATER_SOCKET_BIND = "/var/run/docker.sock:/var/run/docker.sock"
+PORTAINER_UPDATER_PULL_TIMEOUT = timedelta(minutes=5)
+# A second start for the same Portainer container inside this window is
+# refused, so a double click or a retried call can't run two helpers against
+# the same container at once. In memory only, and it hides nothing: the
+# update stays listed for as long as core's update entity says it is on.
+PORTAINER_UPDATER_REPEAT_GUARD_SECONDS = 600
+
 BUNDLED_BLUEPRINTS_DIR = Path(__file__).parent / "bundled_blueprints"
 
 BLUEPRINT_FILES = [
@@ -208,6 +241,76 @@ def _stack_switch_entity_id(hass: HomeAssistant, container_device_id: str) -> st
     entity_reg = er.async_get(hass)
     _stack_name, switch_entity_id = _stack_info(device_reg, entity_reg, container_device_id)
     return switch_entity_id
+
+
+# ---------------------------------------------------------------------------
+# Updating Portainer's own server and agent
+#
+# perform_update refuses these (recreating them from inside Portainer stops
+# the process doing the recreate). Portainer's own answer is a short-lived
+# helper container, `portainer-updater`, that runs on the same Docker host
+# with the Docker socket mounted, so it is not affected when the container
+# it replaces is stopped. update_portainer starts that helper through the
+# Portainer API and then returns; it does not wait for the update, because
+# the thing it would be waiting on is the Portainer connection that goes away
+# while the update runs.
+# ---------------------------------------------------------------------------
+def _updater_target_image(image_ref: str | None, container_name: str, host: str) -> str:
+    """The image reference to hand the updater: the container's own current
+    reference (repo and tag), which the updater pulls afresh. Refuses what
+    can't be updated that way."""
+    ref = (image_ref or "").strip()
+    where = f"{container_name} on {host}"
+    if not ref or ref in ("unknown", "unavailable") or _looks_like_bare_digest(ref):
+        raise HomeAssistantError(
+            f"Can't tell which image {where} runs (its image sensor reports "
+            f"'{ref or 'nothing'}'), so there is nothing to tell the updater to pull. "
+            "Update it manually instead."
+        )
+    if "@" in ref:
+        raise HomeAssistantError(
+            f"{where} is pinned to a digest ({ref}), which never changes, so an update "
+            "to it means changing the reference itself. Update it manually instead."
+        )
+    if ":" not in ref.rsplit("/", 1)[-1]:
+        raise HomeAssistantError(
+            f"{where} runs '{ref}' with no tag. Recreate it with an explicit tag "
+            "(for example :lts or a version) and update it manually this once."
+        )
+    return ref
+
+
+def _updater_command(component: str, image: str, schedule_id: str) -> list[str]:
+    """The portainer-updater command line (its entrypoint is the updater
+    binary, so this is the container's Cmd)."""
+    if component == "agent":
+        return ["agent", schedule_id, image]
+    return ["portainer", f"--image={image}"]
+
+
+def _core_container_target(
+    hass: HomeAssistant, device_reg: dr.DeviceRegistry, container_device_id: str
+) -> tuple[object, int, str]:
+    """(core coordinator, endpoint id, container id) for a container device,
+    resolved the way core's own portainer.recreate_container service does."""
+    device = device_reg.async_get(container_device_id)
+    if device is not None:
+        for core_entry in hass.config_entries.async_entries(CORE_PORTAINER_DOMAIN):
+            coordinator = getattr(core_entry, "runtime_data", None)
+            if coordinator is None or not getattr(coordinator, "data", None):
+                continue
+            for data in coordinator.data.values():
+                for container_name, container_data in data.containers.items():
+                    identifier = (
+                        CORE_PORTAINER_DOMAIN,
+                        f"{core_entry.entry_id}_{data.endpoint.id}_{container_name}",
+                    )
+                    if identifier in device.identifiers:
+                        return coordinator, data.endpoint.id, container_data.container.id
+    raise HomeAssistantError(
+        "Couldn't match this container to one of core Portainer's current containers "
+        "(is the Portainer integration loaded, and is the host reachable?)."
+    )
 
 
 async def _refresh_after_action(
@@ -804,6 +907,145 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             supports_response=SupportsResponse.OPTIONAL,
         )
 
+    async def handle_update_portainer(call: ServiceCall) -> dict:
+        update_entity = call.data["update_entity"]
+        dry_run = call.data.get("dry_run", False)
+        entity_reg = er.async_get(hass)
+        device_reg = dr.async_get(hass)
+
+        reg_entry = entity_reg.async_get(update_entity)
+        container_device_id = reg_entry.device_id if reg_entry else None
+        if container_device_id is None:
+            raise ValueError(f"No device found for entity '{update_entity}'")
+
+        component = _portainer_component(hass, entity_reg, container_device_id)
+        if component is None:
+            raise HomeAssistantError(
+                f"'{update_entity}' is not Portainer's own server or agent. "
+                f"Use {DOMAIN}.{SERVICE_PERFORM_UPDATE} for other containers."
+            )
+
+        host_id = _walk_to_root(device_reg, container_device_id)
+        host_name = _device_name(device_reg, host_id) or "unknown host"
+        state = hass.states.get(update_entity)
+        container_name = _device_name(device_reg, container_device_id) or (
+            state.attributes.get("friendly_name", update_entity) if state else update_entity
+        )
+        update_pending = state is not None and state.state == "on"
+        if not update_pending and not dry_run:
+            raise HomeAssistantError(
+                f"No update is pending for {container_name} on {host_name} "
+                f"({update_entity} is '{state.state if state else 'missing'}')."
+            )
+
+        image_entity_id = _container_image_entity_id(hass, entity_reg, container_device_id)
+        image_state = hass.states.get(image_entity_id) if image_entity_id else None
+        target_image = _updater_target_image(
+            image_state.state if image_state else None, container_name, host_name
+        )
+        coordinator, endpoint_id, container_id = _core_container_target(
+            hass, device_reg, container_device_id
+        )
+
+        schedule_id = str(int(time.time()))
+        command = _updater_command(component, target_image, schedule_id)
+        updater_name = f"portainer-maintenance-updater-{uuid.uuid4().hex[:8]}"
+        plan = {
+            "component": component,
+            "container": container_name,
+            "host": host_name,
+            "endpoint_id": endpoint_id,
+            "container_id": container_id,
+            "target_image": target_image,
+            "updater_image": PORTAINER_UPDATER_IMAGE,
+            "updater_name": updater_name,
+            "command": command,
+            "update_pending": update_pending,
+        }
+        if dry_run:
+            return {**plan, "dry_run": True, "started": False}
+
+        started = hass.data[DOMAIN][entry.entry_id].setdefault("updater_started", {})
+        now = time.monotonic()
+        last = started.get(container_id)
+        if last is not None and now - last < PORTAINER_UPDATER_REPEAT_GUARD_SECONDS:
+            raise HomeAssistantError(
+                f"An update of {container_name} on {host_name} was started "
+                f"{int(now - last)} s ago and may still be running. Wait a few minutes "
+                "and check the host before starting another."
+            )
+        # Claimed before the first await so two overlapping calls can't both start.
+        started[container_id] = now
+
+        portainer = coordinator.portainer
+        updater_container_id: str | None = None
+        step = "pulling the updater image"
+        try:
+            await portainer.image_recreate(
+                endpoint_id=endpoint_id,
+                image_id=PORTAINER_UPDATER_IMAGE,
+                timeout=PORTAINER_UPDATER_PULL_TIMEOUT,
+            )
+            step = "creating the updater container"
+            created = await portainer.container_create(
+                endpoint_id=endpoint_id,
+                name=updater_name,
+                image=PORTAINER_UPDATER_IMAGE,
+                config={
+                    "Cmd": command,
+                    "HostConfig": {
+                        "Binds": [PORTAINER_UPDATER_SOCKET_BIND],
+                        "AutoRemove": True,
+                    },
+                },
+            )
+            updater_container_id = created.id
+            step = "starting the updater container"
+            await portainer.start_container(
+                endpoint_id=endpoint_id, container_id=updater_container_id
+            )
+        except Exception as err:
+            started.pop(container_id, None)
+            _LOGGER.error(
+                "%s.update_portainer: failed while %s for '%s' on %s: %s",
+                DOMAIN, step, container_name, host_name, err,
+            )
+            if updater_container_id is not None:
+                # Created but never started, so AutoRemove won't clear it.
+                try:
+                    await portainer.delete_container(
+                        endpoint_id=endpoint_id, container_id=updater_container_id, force=True
+                    )
+                except Exception as cleanup_err:  # noqa: BLE001 - best effort
+                    _LOGGER.warning(
+                        "%s.update_portainer: couldn't remove the unstarted updater %s: %s",
+                        DOMAIN, updater_name, cleanup_err,
+                    )
+            raise HomeAssistantError(
+                f"Updating {container_name} on {host_name} failed while {step}: {err}"
+            ) from err
+
+        _LOGGER.warning(
+            "%s.update_portainer: started %s (%s) on %s to update '%s' to %s. "
+            "Portainer will be unavailable while it restarts.",
+            DOMAIN, updater_name, updater_container_id, host_name, container_name, target_image,
+        )
+        return {
+            **plan,
+            "dry_run": False,
+            "started": True,
+            "updater_container_id": updater_container_id,
+        }
+
+    if not hass.services.has_service(DOMAIN, SERVICE_UPDATE_PORTAINER):
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_UPDATE_PORTAINER,
+            handle_update_portainer,
+            schema=SERVICE_UPDATE_PORTAINER_SCHEMA,
+            supports_response=SupportsResponse.OPTIONAL,
+        )
+
     async def handle_update_done(call: ServiceCall) -> None:
         await _async_update_done(hass, entry, call.data["device_name"], call.data["update_entity"])
 
@@ -916,4 +1158,5 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             hass.services.async_remove(DOMAIN, SERVICE_RESTART_STACK)
             hass.services.async_remove(DOMAIN, SERVICE_HIDE_UPDATE_ENTITIES)
             hass.services.async_remove(DOMAIN, SERVICE_DISMISS_TROUBLE_ITEM)
+            hass.services.async_remove(DOMAIN, SERVICE_UPDATE_PORTAINER)
     return unload_ok
