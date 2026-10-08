@@ -762,19 +762,12 @@ async def _fetch_oci_source_label(hass: HomeAssistant, host: str | None, repo: s
 # Coordinators -- one per sensor, matching the original recompute cadence.
 # ---------------------------------------------------------------------------
 
-RECENTLY_CONFIRMED_GRACE = timedelta(hours=25)
-
-
 class PortainerUpdatesCoordinator(DataUpdateCoordinator[list[dict]]):
     """Ports the original 5-minute update_items template."""
 
     def __init__(self, hass: HomeAssistant) -> None:
         super().__init__(hass, _LOGGER, name=SENSOR_UPDATES_PENDING, update_interval=timedelta(minutes=5))
-        self._recently_confirmed: dict[str, datetime] = {}
         self._changelog_cache: dict[str, str | None] = {}
-
-    def mark_recently_updated(self, update_entity: str) -> None:
-        self._recently_confirmed[update_entity] = dt_util.utcnow()
 
     async def _resolve_changelog_url(
         self, entity_reg: er.EntityRegistry, container_device_id: str | None
@@ -849,7 +842,6 @@ class PortainerUpdatesCoordinator(DataUpdateCoordinator[list[dict]]):
         entity_reg = er.async_get(self.hass)
         device_reg = dr.async_get(self.hass)
         found: list[dict] = []
-        now = dt_util.utcnow()
 
         # Computed once per poll, not once per item -- see
         # _stacks_with_open_trouble's docstring. Cheap (registry/state
@@ -860,17 +852,14 @@ class PortainerUpdatesCoordinator(DataUpdateCoordinator[list[dict]]):
             if not entity_id.startswith("update."):
                 continue
             state = self.hass.states.get(entity_id)
-            if state is None or state.state == "off":
-                self._recently_confirmed.pop(entity_id, None)
+            # An update is listed exactly while the core Portainer update
+            # entity says "on". There is deliberately no local "recently
+            # installed" hold: on HA 2026.10+ core re-checks a recreated
+            # container's image straight away, so the entity goes "off" by
+            # itself once the install has really worked, and stays "on" if
+            # it has not -- which is the honest answer.
+            if state is None or state.state != "on":
                 continue
-            if state.state != "on":
-                continue
-
-            confirmed_at = self._recently_confirmed.get(entity_id)
-            if confirmed_at is not None:
-                if now - confirmed_at < RECENTLY_CONFIRMED_GRACE:
-                    continue
-                del self._recently_confirmed[entity_id]
 
             reg_entry = entity_reg.async_get(entity_id)
             device_id = reg_entry.device_id if reg_entry else None
