@@ -22,18 +22,22 @@ from __future__ import annotations
 import json
 import logging
 import re
+from collections.abc import Mapping
 from datetime import datetime, timedelta
+from typing import Any
 
 import aiohttp
 
 import homeassistant.util.dt as dt_util
 from homeassistant.components.sensor import SensorEntity
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.const import EVENT_STATE_CHANGED, STATE_UNAVAILABLE
+from homeassistant.core import CALLBACK_TYPE, HomeAssistant, callback
 from homeassistant.helpers import aiohttp_client, device_registry as dr, entity_registry as er
 from homeassistant.helpers.device_registry import DeviceEntryType
 from homeassistant.helpers.entity import DeviceInfo, EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.event import async_call_later
 from homeassistant.helpers.update_coordinator import CoordinatorEntity, DataUpdateCoordinator
 
 from .const import (
@@ -48,8 +52,11 @@ from .dismissals import DismissalStore
 
 _LOGGER = logging.getLogger(__name__)
 
-TROUBLE_SETTLE_SECONDS = 120
-STALE_FLOOR_SECONDS = 43200  # 12 hours
+# How long a change in availability has to stand before anything is reported
+# from it. Entity `last_changed` resets on a Home Assistant restart (every
+# restored entity is written afresh), so this doubles as the quiet period
+# after startup. Used by the Trouble items and by Stale Devices.
+SETTLE_SECONDS = 120
 
 
 # ---------------------------------------------------------------------------
@@ -907,7 +914,7 @@ class PortainerTroubleCoordinator(DataUpdateCoordinator[list[dict]]):
       - an Endpoint that's dropped out of core's own coordinator data
         entirely (kind="endpoint") -- core gives no dedicated signal for
         this; every entity on the device just goes unavailable. Settled
-        the same TROUBLE_SETTLE_SECONDS as container issues, to avoid
+        the same SETTLE_SECONDS as container issues, to avoid
         flapping on a brief poll hiccup. Carries the endpoint's own
         device_id so the webapp's Reload Endpoint button can call
         portainer_maintenance.reload_endpoint directly.
@@ -965,7 +972,7 @@ class PortainerTroubleCoordinator(DataUpdateCoordinator[list[dict]]):
             since = _endpoint_unavailable_since(self.hass, entity_reg, endpoint_device_id)
             if since is None:
                 continue
-            if (now - since).total_seconds() < TROUBLE_SETTLE_SECONDS:
+            if (now - since).total_seconds() < SETTLE_SECONDS:
                 continue
             host = _device_name(device_reg, endpoint_device_id) or "unknown host"
             found.append(
@@ -986,7 +993,7 @@ class PortainerTroubleCoordinator(DataUpdateCoordinator[list[dict]]):
             state = self.hass.states.get(entity_id)
             if state is None or state.state not in ("exited", "dead"):
                 continue
-            if (now - state.last_changed).total_seconds() < TROUBLE_SETTLE_SECONDS:
+            if (now - state.last_changed).total_seconds() < SETTLE_SECONDS:
                 continue
 
             reg_entry = entity_reg.async_get(entity_id)
@@ -1012,7 +1019,7 @@ class PortainerTroubleCoordinator(DataUpdateCoordinator[list[dict]]):
             state = self.hass.states.get(entity_id)
             if state is None or state.state != "unhealthy":
                 continue
-            if (now - state.last_changed).total_seconds() < TROUBLE_SETTLE_SECONDS:
+            if (now - state.last_changed).total_seconds() < SETTLE_SECONDS:
                 continue
 
             reg_entry = entity_reg.async_get(entity_id)
@@ -1120,88 +1127,218 @@ class PortainerTroubleCoordinator(DataUpdateCoordinator[list[dict]]):
 
 
 class PortainerStaleCoordinator(DataUpdateCoordinator[list[dict]]):
-    """Ports the original hourly stale_items template (12h floor)."""
+    """Devices Portainer no longer reports, found by walking the device tree
+    (endpoint -> stack -> container) instead of by how long they have been
+    unavailable.
+
+    Core's portainer integration marks a container, stack or volume entity
+    unavailable the moment Portainer stops listing it, and never removes the
+    device. A device is *gone* when every enabled entity on it is
+    unavailable, *live* when at least one is not, and is left out of the
+    walk when it has no enabled entities or one of them has no state yet.
+
+    Walking down from each healthy endpoint:
+
+      - a gone child with no live device anywhere beneath it is stale,
+        together with everything beneath it. That is an unavailable stack
+        whose containers are all unavailable, or a lone container directly
+        under the endpoint;
+      - a live child (a stack, running or stopped) is walked into the same
+        way, so a gone container under a live stack is stale. A stopped
+        stack lists no containers in Portainer either, so its containers
+        are stale by this rule too: core re-creates the device and entities
+        of any container name it has not seen the moment the stack starts
+        again, so removing them is safe;
+      - a gone child that still has a live device beneath it is left alone.
+
+    A group is only reported once the newest change among its entities is
+    SETTLE_SECONDS old, so a restart (which rewrites every restored state),
+    a stack redeploy or a poll hiccup can't produce a stale report.
+
+    Event driven, no polling. A Portainer entity flipping into or out of
+    `unavailable` starts one SETTLE_SECONDS timer (further flips inside that
+    window don't extend it), after which the walk runs. Device and entity
+    registry changes re-run it straight away, so deleting a stale device
+    clears it from the list at once. If a pass skipped a group only because
+    it was still inside the settle window, it schedules itself again for
+    when that window ends.
+    """
 
     def __init__(self, hass: HomeAssistant) -> None:
-        super().__init__(hass, _LOGGER, name=SENSOR_STALE_DEVICES, update_interval=timedelta(hours=1))
+        super().__init__(hass, _LOGGER, name=SENSOR_STALE_DEVICES, update_interval=None)
+        self._unsubs: list[CALLBACK_TYPE] = []
+        self._timer: CALLBACK_TYPE | None = None
+        self._timer_due = 0.0
+
+    # -- event wiring ------------------------------------------------------
+
+    @callback
+    def async_start(self) -> None:
+        """Start re-scanning on changes. Call once, after the first refresh."""
+        bus = self.hass.bus
+        self._unsubs = [
+            bus.async_listen(
+                EVENT_STATE_CHANGED,
+                self._handle_availability_flip,
+                event_filter=self._is_availability_flip,
+            ),
+            bus.async_listen(dr.EVENT_DEVICE_REGISTRY_UPDATED, self._handle_registry_updated),
+            bus.async_listen(er.EVENT_ENTITY_REGISTRY_UPDATED, self._handle_registry_updated),
+        ]
+
+    @callback
+    def async_stop(self) -> None:
+        for unsub in self._unsubs:
+            unsub()
+        self._unsubs = []
+        if self._timer is not None:
+            self._timer()
+            self._timer = None
+
+    @callback
+    def _is_availability_flip(self, event_or_data: Any) -> bool:
+        """Cheap pre-filter: only a Portainer entity going to or from
+        `unavailable` (or appearing/disappearing that way) can change the
+        answer. Takes the event or its data, whichever this Home Assistant
+        version passes to an event filter."""
+        data: Mapping[str, Any] = getattr(event_or_data, "data", event_or_data)
+        old, new = data.get("old_state"), data.get("new_state")
+        was_gone = old is not None and old.state == STATE_UNAVAILABLE
+        is_gone = new is not None and new.state == STATE_UNAVAILABLE
+        if was_gone == is_gone:
+            return False
+        entry = er.async_get(self.hass).async_get(data.get("entity_id"))
+        return entry is not None and entry.platform == "portainer"
+
+    @callback
+    def _handle_availability_flip(self, _event: Any) -> None:
+        self._schedule_scan(SETTLE_SECONDS + 1)
+
+    @callback
+    def _handle_registry_updated(self, _event: Any) -> None:
+        # Not gated: a registry change doesn't need to settle, and a group
+        # that is still inside its settle window is skipped by the scan
+        # itself. The coordinator's own debouncer coalesces bursts.
+        self.hass.async_create_task(self.async_request_refresh())
+
+    @callback
+    def _schedule_scan(self, delay: float) -> None:
+        due = self.hass.loop.time() + delay
+        if self._timer is not None:
+            if self._timer_due <= due:
+                return
+            self._timer()
+        self._timer_due = due
+        self._timer = async_call_later(self.hass, delay, self._timer_fired)
+
+    @callback
+    def _timer_fired(self, _now: datetime) -> None:
+        self._timer = None
+        self.hass.async_create_task(self.async_refresh())
+
+    # -- the walk ----------------------------------------------------------
 
     async def _async_update_data(self) -> list[dict]:
         entity_reg = er.async_get(self.hass)
         device_reg = dr.async_get(self.hass)
         now = dt_util.utcnow()
-        portainer_ids = set(_portainer_entity_ids(entity_reg))
 
-        devices_seen: set[str] = set()
-        for entity_id in portainer_ids:
-            reg_entry = entity_reg.async_get(entity_id)
-            if reg_entry and reg_entry.device_id:
-                devices_seen.add(reg_entry.device_id)
+        entities_by_device: dict[str, list[str]] = {}
+        for entry in entity_reg.entities.values():
+            if entry.platform != "portainer" or not entry.device_id or entry.disabled_by is not None:
+                continue
+            entities_by_device.setdefault(entry.device_id, []).append(entry.entity_id)
+
+        children: dict[str, list[str]] = {}
+        for device_id in entities_by_device:
+            device = device_reg.async_get(device_id)
+            if device is not None and device.via_device_id:
+                children.setdefault(device.via_device_id, []).append(device_id)
+
+        def states_of(device_id: str) -> list:
+            return [self.hass.states.get(e) for e in entities_by_device.get(device_id, ())]
+
+        def status(device_id: str) -> str:
+            """'gone' (all unavailable), 'live', or 'unknown' (nothing to judge by)."""
+            states = states_of(device_id)
+            if not states or any(s is None for s in states):
+                return "unknown"
+            if all(s.state == STATE_UNAVAILABLE for s in states):
+                return "gone"
+            return "live"
+
+        def descendants(device_id: str, seen: set[str]) -> list[str]:
+            out: list[str] = []
+            for child in children.get(device_id, ()):
+                if child in seen:
+                    continue
+                seen.add(child)
+                out.append(child)
+                out.extend(descendants(child, seen))
+            return out
+
+        # device_id -> (group root device_id, is_root)
+        stale: dict[str, tuple[str, bool]] = {}
+        wait_for: float | None = None
+
+        def walk(node: str, host_root: str, visited: set[str]) -> None:
+            nonlocal wait_for
+            for child in children.get(node, ()):
+                if child in visited:
+                    continue
+                visited.add(child)
+                if status(child) == "gone":
+                    below = descendants(child, set(visited))
+                    if any(status(d) == "live" for d in below):
+                        continue
+                    group = [child, *below]
+                    newest = min(
+                        (now - s.last_changed).total_seconds()
+                        for d in group
+                        for s in states_of(d)
+                        if s is not None
+                    )
+                    if newest < SETTLE_SECONDS:
+                        remaining = SETTLE_SECONDS - newest
+                        wait_for = remaining if wait_for is None else max(wait_for, remaining)
+                        continue
+                    for d in group:
+                        stale[d] = (host_root, d == child)
+                    visited.update(below)
+                else:
+                    walk(child, host_root, visited)
+
+        for root_id in sorted(_discover_endpoint_devices(entity_reg, device_reg)):
+            # An endpoint that is itself down says nothing about its children:
+            # core drops the whole host from its data, so everything under it
+            # reads unavailable. That is the Trouble tab's job, not this one's.
+            own_states = states_of(root_id)
+            if any(s is None or s.state == STATE_UNAVAILABLE for s in own_states):
+                continue
+            walk(root_id, root_id, {root_id})
+
+        if wait_for is not None:
+            self._schedule_scan(wait_for + 1)
 
         found: list[dict] = []
-
-        for device_id in devices_seen:
-            root_id = _walk_to_root(device_reg, device_id)
-
-            if root_id == device_id:
-                continue
-
-            # (fix) Only ENABLED entities count. A disabled entity (core's
-            # portainer integration registers several endpoint sensors
-            # disabled by default) never has a state object at all, so
-            # hass.states.get() returns None for it forever -- which the
-            # `s is None` guards below read as "not settled yet" and skip
-            # the device, or treat as "unhealthy" for the host check.
-            dev_entities = [
-                e.entity_id
-                for e in entity_reg.entities.values()
-                if e.device_id == device_id and e.entity_id in portainer_ids and e.disabled_by is None
-            ]
-            if not dev_entities:
-                continue
-
-            states = [self.hass.states.get(e) for e in dev_entities]
-            if any(s is None for s in states):
-                continue
-            if not all(s.state == "unavailable" for s in states):
-                continue
-
+        for device_id, (root_id, is_root) in stale.items():
             host_name = _device_name(device_reg, root_id) or "unknown host"
-
-            if root_id and root_id != device_id:
-                endpoint_entities = [
-                    e.entity_id
-                    for e in entity_reg.entities.values()
-                    if e.device_id == root_id and e.entity_id in portainer_ids and e.disabled_by is None
-                ]
-                if endpoint_entities:
-                    endpoint_states = [self.hass.states.get(e) for e in endpoint_entities]
-                    endpoint_healthy = all(
-                        s is not None and s.state != "unavailable" for s in endpoint_states
-                    )
-                else:
-                    endpoint_healthy = True
-            else:
-                endpoint_healthy = True
-
-            if not endpoint_healthy:
-                continue
-
-            min_age = min((now - s.last_changed).total_seconds() for s in states)
-            if min_age < STALE_FLOOR_SECONDS:
-                continue
-
             name = _device_name(device_reg, device_id) or device_id
             found.append(
                 {
                     "name": f"{name} ({host_name})",
-                    "secondary_info": "Stale — 12h+ unavailable, host healthy",
+                    "secondary_info": (
+                        "Stale — no longer in Portainer"
+                        if is_root
+                        else "Stale — its stack is no longer in Portainer"
+                    ),
                     "device_id": device_id,
                     "host": host_name,
                     "host_device_id": root_id,
                     "navigation_path": f"/config/devices/device/{device_id}",
                 }
             )
-
+        found.sort(key=lambda item: (item["host"], item["name"], item["device_id"]))
         return found
 
 
@@ -1352,6 +1489,11 @@ async def async_setup_entry(
     await trouble_coordinator.async_config_entry_first_refresh()
     await stale_coordinator.async_config_entry_first_refresh()
     await cleanup_coordinator.async_config_entry_first_refresh()
+
+    # Stale Devices isn't polled: it re-scans when a Portainer entity goes to
+    # or from unavailable, or a device/entity registry entry changes.
+    stale_coordinator.async_start()
+    entry.async_on_unload(stale_coordinator.async_stop)
 
     hass.data[DOMAIN][entry.entry_id]["coordinators"] = {
         "updates": updates_coordinator,
