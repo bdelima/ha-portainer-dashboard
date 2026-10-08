@@ -13,6 +13,11 @@ native `perform_update`/`update_done` services -- see __init__.py -- and
 a native service has no per-instance blueprint input to read from. Reuses
 the same values you'd pick for the automation blueprint; it's fine if
 they're the same devices in both places.
+
+admin_only (default off) registers the sidebar panel as administrator-only,
+the way HACS does for its own. It lives here because Home Assistant's
+Settings -> Dashboards page doesn't list an integration's panel, so there is
+no other place in the UI to flip it.
 """
 from __future__ import annotations
 
@@ -23,7 +28,7 @@ import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.helpers import selector
 
-from .const import CONF_NOTIFY_DEVICES, CONF_WEBAPP_URL, DOMAIN
+from .const import CONF_ADMIN_ONLY, CONF_NOTIFY_DEVICES, CONF_WEBAPP_URL, DOMAIN
 
 
 def _schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
@@ -41,6 +46,9 @@ def _schema(defaults: dict[str, Any] | None = None) -> vol.Schema:
     return vol.Schema(
         {
             webapp_key: str,
+            vol.Optional(
+                CONF_ADMIN_ONLY, default=defaults.get(CONF_ADMIN_ONLY, False)
+            ): bool,
             notify_key: selector.selector(
                 {
                     "device": {
