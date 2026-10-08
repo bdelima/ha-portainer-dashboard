@@ -203,7 +203,9 @@ CORE_PORTAINER_DOMAIN = "portainer"
 # Portainer's helper image for updating Portainer in place. Its source is
 # github.com/portainer/portainer-updater; the command lines below are the
 # ones its README documents ("portainer --image=<ref>" for the server,
-# "agent <schedule-id> <image>" for the agent).
+# "agent <schedule-id> <image>" for the agent). The server command also
+# passes --health-check, which exists only on the updater's "portainer"
+# command (the "agent" command has no such flag and rejects it).
 PORTAINER_UPDATER_IMAGE = "portainer/portainer-updater:latest"
 PORTAINER_UPDATER_SOCKET_BIND = "/var/run/docker.sock:/var/run/docker.sock"
 PORTAINER_UPDATER_PULL_TIMEOUT = timedelta(minutes=5)
@@ -282,10 +284,23 @@ def _updater_target_image(image_ref: str | None, container_name: str, host: str)
 
 def _updater_command(component: str, image: str, schedule_id: str) -> list[str]:
     """The portainer-updater command line (its entrypoint is the updater
-    binary, so this is the container's Cmd)."""
+    binary, so this is the container's Cmd).
+
+    The server command passes --health-check: after starting the new
+    Portainer the updater runs the new image's own "/portainer
+    --health-check" until it passes, and if it never does (or the new
+    container fails to start) it also rolls the Portainer database back to
+    its pre-update state, then removes the new container and restarts the
+    old one. Without the flag it still restarts the old container on a
+    failed start or failed Docker health check, but does not roll the
+    database back, which matters when the new version has already migrated
+    it. An image too old to know the flag is treated as healthy by the
+    updater, so the flag is safe on any image. The agent command takes no
+    such flag (the updater checks a new agent on its own), so none is
+    passed there."""
     if component == "agent":
         return ["agent", schedule_id, image]
-    return ["portainer", f"--image={image}"]
+    return ["portainer", f"--image={image}", "--health-check"]
 
 
 def _core_container_target(
