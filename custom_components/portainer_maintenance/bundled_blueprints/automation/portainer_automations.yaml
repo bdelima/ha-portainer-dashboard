@@ -173,6 +173,39 @@ blueprint:
       selector:
         boolean: {}
 
+    # (new) Update-available pushes fire once per newly-appeared update (and
+    # once more at startup), so an update left alone is never mentioned
+    # again. This is a once-a-day nudge while any are still pending. A time
+    # of day rather than an interval because a blueprint has nowhere to
+    # keep "when did I last remind" between runs.
+    updates_reminder_enabled:
+      name: Updates -- Daily Reminder
+      description: >-
+        Send one reminder push a day, at the time below, while at least
+        one update is still pending. Uses the Updates channel above, and
+        replaces the earlier "update available" / startup recheck push in
+        the notification tray rather than adding another. Turn off if you
+        only want the push when an update first appears.
+      default: true
+      selector:
+        boolean: {}
+    updates_reminder_time:
+      name: Updates -- Reminder Time
+      description: >-
+        Time of day for the reminder above. Ignored when the reminder is
+        off.
+      default: "09:00:00"
+      selector:
+        time: {}
+
+# Keep 50 traces of this automation's runs (Home Assistant's default is 5).
+# Every trigger below -- sensor changes, notification actions, entity registry
+# updates, startup -- runs this one automation and each run is a trace, so a
+# handful of unrelated runs pushes out the one you are trying to look at.
+# Takes effect once Home Assistant has loaded this version of the blueprint.
+trace:
+  stored_traces: 50
+
 trigger:
   - id: update_available
     trigger: state
@@ -195,6 +228,9 @@ trigger:
   - id: entity_registry_updated
     trigger: event
     event_type: entity_registry_updated
+  - id: updates_reminder
+    trigger: time
+    at: !input updates_reminder_time
 
 action:
   - variables:
@@ -208,6 +244,7 @@ action:
       updates_channel_name: !input updates_channel
       updates_bypass_dnd: !input updates_bypass_dnd
       updates_channel: "{{ 'alarm_stream' if updates_bypass_dnd else updates_channel_name }}"
+      updates_reminder_enabled: !input updates_reminder_enabled
       trouble_channel_name: !input trouble_channel
       trouble_bypass_dnd: !input trouble_bypass_dnd
       trouble_channel: "{{ 'alarm_stream' if trouble_bypass_dnd else trouble_channel_name }}"
@@ -338,6 +375,33 @@ action:
                       # (update performed, stack restart needed) picked
                       # this up in 1.3.0; this blueprint-issued push was
                       # missed at the time, fixed here in 1.3.1.
+                      actions:
+                        - action: "dismiss"
+                          title: "Dismiss"
+
+      # 5b. (new) Daily reminder while updates are still pending. Same tag
+      #     as the update-available and startup pushes, so it replaces them
+      #     in the tray instead of stacking. Does nothing when the reminder
+      #     is turned off or nothing is pending.
+      - conditions:
+          - condition: trigger
+            id: updates_reminder
+          - condition: template
+            value_template: "{{ updates_reminder_enabled and states('sensor.portainer_updates_pending') | int(0) > 0 }}"
+        sequence:
+          - repeat:
+              for_each: "{{ notify_services }}"
+              sequence:
+                - action: "{{ repeat.item }}"
+                  data:
+                    title: "Updates still pending"
+                    message: >
+                      {{ states('sensor.portainer_updates_pending') }} pending update{{ 's' if states('sensor.portainer_updates_pending') | int != 1 else '' }}. Tap to review.
+                    data:
+                      tag: "portainer_updates_pending"
+                      channel: "{{ updates_channel }}"
+                      clickAction: "{{ states('sensor.portainer_actions_url') }}"
+                      url: "{{ states('sensor.portainer_actions_url') }}"
                       actions:
                         - action: "dismiss"
                           title: "Dismiss"
