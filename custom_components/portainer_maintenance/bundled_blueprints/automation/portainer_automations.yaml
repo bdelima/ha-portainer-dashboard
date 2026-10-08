@@ -173,6 +173,14 @@ blueprint:
       selector:
         boolean: {}
 
+# Keep 50 traces of this automation's runs (Home Assistant's default is 5).
+# Every trigger below -- sensor changes, notification actions, entity registry
+# updates, startup -- runs this one automation and each run is a trace, so a
+# handful of unrelated runs pushes out the one you are trying to look at.
+# Takes effect once Home Assistant has loaded this version of the blueprint.
+trace:
+  stored_traces: 50
+
 trigger:
   - id: update_available
     trigger: state
