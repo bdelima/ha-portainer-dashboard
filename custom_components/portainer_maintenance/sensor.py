@@ -44,6 +44,7 @@ from .const import (
     SENSOR_TROUBLE,
     SENSOR_UPDATES_PENDING,
 )
+from .dismissals import DismissalStore
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -296,6 +297,114 @@ def _stacks_with_open_trouble(hass: HomeAssistant, entity_reg: er.EntityRegistry
         for item in _find_stuck_containers(hass, entity_reg, device_reg)
         if item["stack_device_id"]
     }
+
+
+# ---------------------------------------------------------------------------
+# Portainer's own containers: the server and the agent. Portainer performs
+# every container recreate on a host through its server (or, for a remote
+# host, through that host's agent), so recreating one of those containers
+# from inside Portainer stops the process doing the work before the
+# replacement is started: it was observed to leave Portainer stopped. Their
+# updates therefore can't be installed from the dashboard; they are reported
+# as Needs Remediation items instead (see PortainerTroubleCoordinator) and
+# perform_update refuses them.
+# ---------------------------------------------------------------------------
+PORTAINER_SERVER_IMAGE_REPOS = frozenset({"portainer/portainer-ce", "portainer/portainer-ee"})
+PORTAINER_AGENT_IMAGE_REPOS = frozenset({"portainer/agent"})
+# Only used when the container's image sensor can't say what it runs.
+_PORTAINER_FALLBACK_NAMES = {
+    "portainer": "server",
+    "portainer_agent": "agent",
+    "portainer-agent": "agent",
+}
+
+
+def _portainer_component(
+    hass: HomeAssistant, entity_reg: er.EntityRegistry, container_device_id: str | None
+) -> str | None:
+    """"server" or "agent" when the container is one of Portainer's own,
+    otherwise None. Matched on the container's image repo; falls back to the
+    container's name only when its image sensor can't say (missing, unknown,
+    unavailable, or a bare digest)."""
+    if container_device_id is None:
+        return None
+    image_entity_id = _container_image_entity_id(hass, entity_reg, container_device_id)
+    state = hass.states.get(image_entity_id) if image_entity_id else None
+    image_ref = state.state if state else None
+    if image_ref and image_ref not in ("unknown", "unavailable") and not _looks_like_bare_digest(image_ref):
+        _host, repo = _split_image_repo(image_ref)
+        repo = repo.lower() if repo else None
+        if repo in PORTAINER_SERVER_IMAGE_REPOS:
+            return "server"
+        if repo in PORTAINER_AGENT_IMAGE_REPOS:
+            return "agent"
+        return None
+    device_reg = dr.async_get(hass)
+    name = _device_name(device_reg, container_device_id)
+    return _PORTAINER_FALLBACK_NAMES.get(name.strip().lower()) if name else None
+
+
+def _portainer_self_update_detail(container_name: str, host: str, component: str = "server") -> str:
+    if component == "agent":
+        return (
+            f"{container_name} on {host} is the Portainer agent, so it can't be updated from here: "
+            f"Portainer reaches {host} through this agent, and recreating the agent stops the "
+            "connection that is doing the recreate, which leaves it stopped. Update it on the host "
+            "instead -- pull the new image and recreate the container the way it was deployed (for "
+            "a compose file, `docker compose pull && docker compose up -d` in that file's "
+            "directory). Keep the agent on the same version as the Portainer server. "
+            f"Do any other updates on {host} first, since Portainer can't manage {host} while the "
+            "agent restarts."
+        )
+    return (
+        f"{container_name} on {host} is Portainer itself, so it can't be updated from here: "
+        "Portainer performs every container recreate, and recreating its own container stops it "
+        "before the replacement is started, which leaves it stopped. Update it on the host "
+        "instead -- pull the new image and recreate the container from the compose file it was "
+        "deployed with (`docker compose pull && docker compose up -d` in that file's directory). "
+        f"Do any other updates on {host} first, since Portainer is unavailable while it restarts."
+    )
+
+
+def _dismiss_key(kind: str, identity: str) -> str:
+    return f"{kind}:{identity}"
+
+
+def _find_portainer_self_updates(
+    hass: HomeAssistant, entity_reg: er.EntityRegistry, device_reg: dr.DeviceRegistry
+) -> list[dict]:
+    """Pending update.* entities that belong to Portainer's own containers
+    (server or agent)."""
+    found: list[dict] = []
+    for entity_id in _portainer_entity_ids(entity_reg):
+        if not entity_id.startswith("update."):
+            continue
+        state = hass.states.get(entity_id)
+        if state is None or state.state != "on":
+            continue
+        reg_entry = entity_reg.async_get(entity_id)
+        device_id = reg_entry.device_id if reg_entry else None
+        component = _portainer_component(hass, entity_reg, device_id)
+        if component is None:
+            continue
+        root_id = _walk_to_root(device_reg, device_id)
+        host = _device_name(device_reg, root_id) or "unknown host"
+        container_name = _device_name(device_reg, device_id) or state.attributes.get(
+            "friendly_name", entity_id
+        )
+        found.append(
+            {
+                "entity": entity_id,
+                "device_id": device_id,
+                "host": host,
+                "host_device_id": root_id,
+                "container_name": container_name,
+                "component": component,
+                "stack_name": _stack_info(device_reg, entity_reg, device_id)[0],
+                "stack_device_id": _stack_device_id(device_reg, device_id),
+            }
+        )
+    return found
 
 
 # ---------------------------------------------------------------------------
@@ -765,6 +874,11 @@ class PortainerUpdatesCoordinator(DataUpdateCoordinator[list[dict]]):
 
             reg_entry = entity_reg.async_get(entity_id)
             device_id = reg_entry.device_id if reg_entry else None
+            # Portainer's own updates (server, agent) can't be installed from
+            # here -- they are reported on the Trouble sensor instead (see
+            # _find_portainer_self_updates).
+            if _portainer_component(self.hass, entity_reg, device_id) is not None:
+                continue
             root_id = _walk_to_root(device_reg, device_id)
             host = _device_name(device_reg, root_id) or "unknown host"
             container_name = _device_name(device_reg, device_id) or state.attributes.get(
@@ -819,10 +933,24 @@ class PortainerTroubleCoordinator(DataUpdateCoordinator[list[dict]]):
         webapp's More Info dialog). Deliberately NOT settled -- see
         _find_stuck_containers's docstring for why this is stateless and
         needs no settle window to avoid flapping.
+
+      - A pending update for one of Portainer's own containers, the server
+        or the agent (kind="portainer_self_update", with component="server"
+        or "agent"): it can't be applied from here (see
+        _portainer_component), so it is listed with a `detail` string
+        describing the manual fix.
+
+    Items the user can't act on from the dashboard carry a `dismiss_key`
+    (container_exited, container_unhealthy, unstacked_recreate,
+    portainer_self_update). One that has been dismissed (see dismissals.py)
+    is left out of the list, and so out of the sensor's count too.
+    endpoint and stack_restart_needed items have real actions and are
+    never dismissible.
     """
 
-    def __init__(self, hass: HomeAssistant) -> None:
+    def __init__(self, hass: HomeAssistant, dismissals: DismissalStore | None = None) -> None:
         super().__init__(hass, _LOGGER, name=SENSOR_TROUBLE, update_interval=timedelta(minutes=1))
+        self._dismissals = dismissals
 
     async def _async_update_data(self) -> list[dict]:
         entity_reg = er.async_get(self.hass)
@@ -879,6 +1007,7 @@ class PortainerTroubleCoordinator(DataUpdateCoordinator[list[dict]]):
                     "stack_name": _stack_info(device_reg, entity_reg, device_id)[0],
                     "name": f"{display_name} ({host})",
                     "secondary_info": state.state,
+                    "dismiss_key": _dismiss_key("container_exited", entity_id),
                 }
             )
 
@@ -904,6 +1033,7 @@ class PortainerTroubleCoordinator(DataUpdateCoordinator[list[dict]]):
                     "stack_name": _stack_info(device_reg, entity_reg, device_id)[0],
                     "name": f"{display_name} ({host})",
                     "secondary_info": "unhealthy",
+                    "dismiss_key": _dismiss_key("container_unhealthy", entity_id),
                 }
             )
 
@@ -932,6 +1062,7 @@ class PortainerTroubleCoordinator(DataUpdateCoordinator[list[dict]]):
                         "host_device_id": item["host_device_id"],
                         "name": item["container_name"],
                         "secondary_info": "Image updated, tag stale",
+                        "dismiss_key": _dismiss_key("unstacked_recreate", item["device_id"]),
                         "detail": (
                             f"{item['container_name']}'s image was pulled successfully, but the "
                             "container itself couldn't be recreated cleanly -- a known Portainer/"
@@ -946,6 +1077,32 @@ class PortainerTroubleCoordinator(DataUpdateCoordinator[list[dict]]):
                     }
                 )
 
+        # -- Portainer's own pending update --------------------------------
+        for item in _find_portainer_self_updates(self.hass, entity_reg, device_reg):
+            found.append(
+                {
+                    "kind": "portainer_self_update",
+                    "entity": item["entity"],
+                    "device_id": item["device_id"],
+                    "host": item["host"],
+                    "host_device_id": item["host_device_id"],
+                    "stack_name": item["stack_name"],
+                    "stack_device_id": item["stack_device_id"],
+                    "name": f"{item['container_name']} ({item['host']})",
+                    "component": item["component"],
+                    "secondary_info": "Update available — apply it on the host",
+                    "dismiss_key": _dismiss_key("portainer_self_update", item["entity"]),
+                    "detail": _portainer_self_update_detail(
+                        item["container_name"], item["host"], item["component"]
+                    ),
+                }
+            )
+
+        if self._dismissals is not None:
+            found = [
+                i for i in found
+                if not (i.get("dismiss_key") and self._dismissals.is_dismissed(i["dismiss_key"]))
+            ]
         return found
 
 
@@ -1167,7 +1324,9 @@ async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
 ) -> None:
     updates_coordinator = PortainerUpdatesCoordinator(hass)
-    trouble_coordinator = PortainerTroubleCoordinator(hass)
+    trouble_coordinator = PortainerTroubleCoordinator(
+        hass, hass.data[DOMAIN][entry.entry_id].get("dismissals")
+    )
     stale_coordinator = PortainerStaleCoordinator(hass)
     cleanup_coordinator = PortainerCleanupCoordinator(hass)
 

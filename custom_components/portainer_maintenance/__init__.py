@@ -60,6 +60,14 @@ On setup this integration:
 
 1f. Registers `portainer_maintenance.hide_update_entities`.
 
+1g. Registers `portainer_maintenance.dismiss_trouble_item` -- hides a
+   Needs Remediation item the user can't act on from the dashboard (see
+   dismissals.py for how long a dismissal lasts). `perform_update` also
+   refuses Portainer's own containers, the server and the agent: recreating
+   one from inside Portainer stops it before the replacement starts (see
+   sensor.py's `_portainer_component`); their updates are listed on the
+   trouble sensor instead.
+
 2. Installs its bundled automation blueprint into HA's config dir
    automatically.
 
@@ -88,13 +96,14 @@ import homeassistant.helpers.config_validation as cv
 import homeassistant.util.dt as dt_util
 from homeassistant.components import frontend
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse
+from homeassistant.core import CoreState, HomeAssistant, ServiceCall, SupportsResponse
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import slugify
 
 from .const import CONF_NOTIFY_DEVICES, CONF_WEBAPP_URL, DOMAIN, PANEL_ICON, PANEL_PATH, PANEL_TITLE
+from .dismissals import DismissalStore
 from .sensor import (
     _container_image_entity_id,
     _device_name,
@@ -104,7 +113,9 @@ from .sensor import (
     _endpoint_volume_usage_entity,
     _endpoint_volumes_prune_button,
     _looks_like_bare_digest,
+    _portainer_component,
     _portainer_entity_ids,
+    _portainer_self_update_detail,
     _stack_info,
     _walk_to_root,
 )
@@ -165,6 +176,9 @@ SERVICE_RESTART_STACK_SCHEMA = vol.Schema({vol.Required("switch_entity_id"): cv.
 
 SERVICE_HIDE_UPDATE_ENTITIES = "hide_update_entities"
 SERVICE_HIDE_UPDATE_ENTITIES_SCHEMA = vol.Schema({})
+
+SERVICE_DISMISS_TROUBLE_ITEM = "dismiss_trouble_item"
+SERVICE_DISMISS_TROUBLE_ITEM_SCHEMA = vol.Schema({vol.Required("dismiss_key"): cv.string})
 
 BUNDLED_BLUEPRINTS_DIR = Path(__file__).parent / "bundled_blueprints"
 
@@ -478,6 +492,13 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN][entry.entry_id] = {}
 
+    # A dismissal outlives restarts, but is only cleared by a Home Assistant
+    # start (not by reloading this integration at runtime) once it is old
+    # enough -- see dismissals.py.
+    dismissals = DismissalStore(hass)
+    await dismissals.async_load(ha_starting=hass.state is not CoreState.running)
+    hass.data[DOMAIN][entry.entry_id]["dismissals"] = dismissals
+
     async def handle_remove_device(call: ServiceCall) -> None:
         device_id = call.data["device_id"]
         registry = dr.async_get(hass)
@@ -690,6 +711,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
         device_name = f"{container_name} ({host_name})"
 
+        # Portainer's server and agent can't recreate themselves (see
+        # sensor.py's _portainer_component): refuse rather than leave them
+        # stopped. Applies to every caller -- the dashboard, the blueprint's
+        # notification action, scripts.
+        portainer_component = _portainer_component(hass, entity_reg, container_device_id)
+        if portainer_component is not None:
+            raise HomeAssistantError(
+                _portainer_self_update_detail(container_name, host_name, portainer_component)
+            )
+
         switch_entity_id = _stack_switch_entity_id(hass, container_device_id)
         image_entity_id = _container_image_entity_id(hass, entity_reg, container_device_id)
         image_before_state = hass.states.get(image_entity_id) if image_entity_id else None
@@ -837,6 +868,26 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             supports_response=SupportsResponse.OPTIONAL,
         )
 
+    async def handle_dismiss_trouble_item(call: ServiceCall) -> None:
+        key = call.data["dismiss_key"].strip()
+        if ":" not in key:
+            raise ValueError(f"'{key}' is not a trouble item dismiss_key")
+        _LOGGER.info("%s.dismiss_trouble_item: dismissing %s", DOMAIN, key)
+        await dismissals.async_dismiss(key)
+        trouble_coordinator = (
+            hass.data.get(DOMAIN, {}).get(entry.entry_id, {}).get("coordinators", {}).get("trouble")
+        )
+        if trouble_coordinator is not None:
+            await trouble_coordinator.async_request_refresh()
+
+    if not hass.services.has_service(DOMAIN, SERVICE_DISMISS_TROUBLE_ITEM):
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_DISMISS_TROUBLE_ITEM,
+            handle_dismiss_trouble_item,
+            schema=SERVICE_DISMISS_TROUBLE_ITEM_SCHEMA,
+        )
+
     await hass.async_add_executor_job(_install_blueprints, hass)
 
     webapp_url = entry.data[CONF_WEBAPP_URL]
@@ -865,4 +916,5 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             hass.services.async_remove(DOMAIN, SERVICE_UPDATE_DONE)
             hass.services.async_remove(DOMAIN, SERVICE_RESTART_STACK)
             hass.services.async_remove(DOMAIN, SERVICE_HIDE_UPDATE_ENTITIES)
+            hass.services.async_remove(DOMAIN, SERVICE_DISMISS_TROUBLE_ITEM)
     return unload_ok

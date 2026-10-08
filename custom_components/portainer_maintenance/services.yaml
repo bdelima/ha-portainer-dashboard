@@ -210,3 +210,25 @@ hide_update_entities:
     intentional, not a bug: this system's design goal is that these
     entities' state belongs on the dashboard, not HA's own entity list.
     Takes no fields; always scans every Portainer update.* entity.
+
+dismiss_trouble_item:
+  name: Dismiss trouble item
+  description: >-
+    Hides one item from the Needs Remediation list (sensor.portainer_trouble)
+    that can't be fixed from the dashboard, so it stops counting toward the
+    trouble total and stops notifying. The item is identified by the
+    dismiss_key the trouble sensor puts on each item it allows dismissing.
+    A dismissal is remembered across restarts and is only cleared when Home
+    Assistant starts and the dismissal is at least 24 hours old, so an item
+    hidden today stays hidden through restarts for a day. There is no
+    un-dismiss; a still-present condition shows up again once the
+    dismissal is cleared that way. Called by the companion
+    ha-portainer-sidecar webapp's Dismiss button.
+  fields:
+    dismiss_key:
+      name: Dismiss key
+      description: The dismiss_key of the trouble item to hide, e.g. container_exited:<device_id>.
+      required: true
+      example: "container_exited:3f9e1c2b4a5d6e7f8091a2b3c4d5e6f7"
+      selector:
+        text:
