@@ -762,7 +762,6 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         coordinators = hass.data.get(DOMAIN, {}).get(entry.entry_id, {}).get("coordinators", {})
         updates_coordinator = coordinators.get("updates")
         if updates_coordinator is not None:
-            updates_coordinator.mark_recently_updated(update_entity)
             await updates_coordinator.async_request_refresh()
 
         # (1.3.0) The broadened Trouble sensor's stuck-container check is
