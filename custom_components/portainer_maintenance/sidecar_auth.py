@@ -21,7 +21,6 @@ from .const import (
     CONF_SIDECAR_ANONYMOUS,
     CONF_SIDECAR_PASSWORD,
     CONF_SIDECAR_USERNAME,
-    DEFAULT_SIDECAR_ANONYMOUS,
 )
 
 
@@ -37,11 +36,15 @@ def panel_url(webapp_url: str, data: Mapping[str, Any]) -> str:
     """The URL the sidebar panel loads.
 
     Unchanged when the entry is set to anonymous, or has no credentials (an
-    entry created before these options existed): the sidecar then shows its
-    own sign-in page. Otherwise ``auth=<token>`` is added to the query,
-    replacing any ``auth`` already there; the fragment is left alone.
+    entry created before these options existed): the sidecar then loads as it
+    is, or shows its own sign-in page if it has one. Otherwise
+    ``auth=<token>`` is added to the query, replacing any ``auth`` already
+    there; the fragment is left alone.
     """
-    if data.get(CONF_SIDECAR_ANONYMOUS, DEFAULT_SIDECAR_ANONYMOUS):
+    # Only an explicit "anonymous" skips the token. The form's default is on, but
+    # stored credentials mean they were meant to be used: setup and Reconfigure
+    # never keep credentials alongside anonymous on.
+    if data.get(CONF_SIDECAR_ANONYMOUS):
         return webapp_url
     username = data.get(CONF_SIDECAR_USERNAME) or ""
     password = data.get(CONF_SIDECAR_PASSWORD) or ""
