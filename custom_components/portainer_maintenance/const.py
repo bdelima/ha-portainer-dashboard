@@ -3,6 +3,11 @@
 DOMAIN = "portainer_maintenance"
 CONF_WEBAPP_URL = "webapp_url"
 CONF_NOTIFY_DEVICES = "notify_devices"
+CONF_ADMIN_ONLY = "admin_only"
+# On by default: the panel is hidden from non-administrator HA users unless
+# someone turns this off. Also what an entry created before the option
+# existed gets.
+DEFAULT_ADMIN_ONLY = True
 
 PANEL_PATH = "portainer-actions"
 PANEL_TITLE = "Portainer Maintenance"

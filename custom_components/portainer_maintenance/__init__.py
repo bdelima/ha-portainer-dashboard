@@ -111,7 +111,16 @@ from homeassistant.helpers import device_registry as dr, entity_registry as er
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from homeassistant.util import slugify
 
-from .const import CONF_NOTIFY_DEVICES, CONF_WEBAPP_URL, DOMAIN, PANEL_ICON, PANEL_PATH, PANEL_TITLE
+from .const import (
+    CONF_ADMIN_ONLY,
+    CONF_NOTIFY_DEVICES,
+    CONF_WEBAPP_URL,
+    DEFAULT_ADMIN_ONLY,
+    DOMAIN,
+    PANEL_ICON,
+    PANEL_PATH,
+    PANEL_TITLE,
+)
 from .dismissals import DismissalStore
 from .sensor import (
     _container_image_entity_id,
@@ -581,28 +590,31 @@ def _install_blueprints(hass: HomeAssistant) -> None:
         _LOGGER.debug("Installed blueprint %s -> %s", src, dest)
 
 
-def _register_panel(hass: HomeAssistant, webapp_url: str) -> None:
+def _register_panel(hass: HomeAssistant, webapp_url: str, require_admin: bool = DEFAULT_ADMIN_ONLY) -> None:
+    """Register the sidebar iframe panel.
+
+    require_admin hides the sidebar entry (and the panel itself) from
+    non-administrator Home Assistant users -- the same flag HACS registers
+    its own panel with. It does not protect the webapp's URL, which stays
+    reachable by anyone who can reach it directly. Home Assistant's
+    Settings -> Dashboards page only lists its built-in panels and
+    user-created dashboards, so this flag can't be flipped there for an
+    integration's panel; it's set from this integration's own
+    Reconfigure form instead (CONF_ADMIN_ONLY).
+    """
+    kwargs = {
+        "component_name": "iframe",
+        "sidebar_title": PANEL_TITLE,
+        "sidebar_icon": PANEL_ICON,
+        "frontend_url_path": PANEL_PATH,
+        "config": {"url": webapp_url},
+        "require_admin": require_admin,
+    }
     try:
-        frontend.async_register_built_in_panel(
-            hass,
-            component_name="iframe",
-            sidebar_title=PANEL_TITLE,
-            sidebar_icon=PANEL_ICON,
-            frontend_url_path=PANEL_PATH,
-            config={"url": webapp_url},
-            require_admin=False,
-        )
+        frontend.async_register_built_in_panel(hass, **kwargs)
     except ValueError:
         frontend.async_remove_panel(hass, PANEL_PATH)
-        frontend.async_register_built_in_panel(
-            hass,
-            component_name="iframe",
-            sidebar_title=PANEL_TITLE,
-            sidebar_icon=PANEL_ICON,
-            frontend_url_path=PANEL_PATH,
-            config={"url": webapp_url},
-            require_admin=False,
-        )
+        frontend.async_register_built_in_panel(hass, **kwargs)
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -1151,7 +1163,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     actions_url = f"/{PANEL_PATH}"
     hass.data[DOMAIN][entry.entry_id]["actions_url"] = actions_url
 
-    _register_panel(hass, webapp_url)
+    # Entries created before CONF_ADMIN_ONLY existed don't carry the key; they
+    # get the default (administrators only) until reconfigured.
+    _register_panel(
+        hass, webapp_url, bool(entry.data.get(CONF_ADMIN_ONLY, DEFAULT_ADMIN_ONLY))
+    )
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     return True

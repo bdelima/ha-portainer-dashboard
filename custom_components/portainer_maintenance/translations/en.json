@@ -6,7 +6,11 @@
         "description": "One-time setup. Enter the URL where the Portainer actions webapp is reachable (e.g. https://actions.o.pumapants.cc), and pick the mobile_app device(s) that should get the \"update performed\" confirmation push. This integration registers it as a sidebar panel, installs its automation blueprint, registers the perform_update/update_done services, computes the notification click-through URL automatically, and exposes the update/trouble/stale tracking sensors.",
         "data": {
           "webapp_url": "Webapp URL",
-          "notify_devices": "Notify device(s)"
+          "notify_devices": "Notify device(s)",
+          "admin_only": "Administrators only"
+        },
+        "data_description": {
+          "admin_only": "Hide the sidebar panel from non-administrator users. This only hides the panel inside Home Assistant; it does not control who can open the webapp's own URL."
         }
       },
       "reconfigure": {
@@ -14,7 +18,11 @@
         "description": "Update the webapp URL and/or notify device(s) for your existing setup.",
         "data": {
           "webapp_url": "Webapp URL",
-          "notify_devices": "Notify device(s)"
+          "notify_devices": "Notify device(s)",
+          "admin_only": "Administrators only"
+        },
+        "data_description": {
+          "admin_only": "Hide the sidebar panel from non-administrator users. This only hides the panel inside Home Assistant; it does not control who can open the webapp's own URL."
         }
       }
     },

@@ -76,6 +76,10 @@ class DismissalStore:
     def is_dismissed(self, key: str) -> bool:
         return key in self._dismissed
 
+    def dismissed_at(self, key: str) -> datetime | None:
+        """When `key` was dismissed, or None if it isn't dismissed."""
+        return self._dismissed.get(key)
+
     async def async_dismiss(self, key: str) -> None:
         self._dismissed[key] = dt_util.utcnow()
         await self._async_save()
