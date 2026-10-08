@@ -18,7 +18,9 @@ CONF_SIDECAR_PASSWORD = "sidecar_password"
 DEFAULT_SIDECAR_ANONYMOUS = True
 
 PANEL_PATH = "portainer-actions"
-PANEL_TITLE = "Portainer Maintenance"
+# What the sidebar entry is called (the integration itself is still named
+# "Portainer Maintenance").
+PANEL_TITLE = "Portainer"
 PANEL_ICON = "mdi:docker"
 
 SENSOR_UPDATES_PENDING = "portainer_updates_pending"
