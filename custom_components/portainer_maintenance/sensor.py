@@ -975,10 +975,16 @@ class PortainerStaleCoordinator(DataUpdateCoordinator[list[dict]]):
             if root_id == device_id:
                 continue
 
+            # (fix) Only ENABLED entities count. A disabled entity (core's
+            # portainer integration registers several endpoint sensors
+            # disabled by default) never has a state object at all, so
+            # hass.states.get() returns None for it forever -- which the
+            # `s is None` guards below read as "not settled yet" and skip
+            # the device, or treat as "unhealthy" for the host check.
             dev_entities = [
                 e.entity_id
                 for e in entity_reg.entities.values()
-                if e.device_id == device_id and e.entity_id in portainer_ids
+                if e.device_id == device_id and e.entity_id in portainer_ids and e.disabled_by is None
             ]
             if not dev_entities:
                 continue
@@ -995,7 +1001,7 @@ class PortainerStaleCoordinator(DataUpdateCoordinator[list[dict]]):
                 endpoint_entities = [
                     e.entity_id
                     for e in entity_reg.entities.values()
-                    if e.device_id == root_id and e.entity_id in portainer_ids
+                    if e.device_id == root_id and e.entity_id in portainer_ids and e.disabled_by is None
                 ]
                 if endpoint_entities:
                     endpoint_states = [self.hass.states.get(e) for e in endpoint_entities]
