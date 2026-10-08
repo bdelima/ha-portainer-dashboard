@@ -20,11 +20,12 @@ Settings -> Dashboards page doesn't list an integration's panel, so there is
 no other place in the UI to flip it.
 
 The sidecar has its own sign-in (AUTH_USERNAME / AUTH_PASSWORD /
-AUTH_ALLOW_ANONYMOUS in its environment). sidecar_anonymous says it is
-running without one; otherwise a second screen collects the username and
-password so the sidebar panel can sign in by itself (see sidecar_auth.py).
-Home Assistant's forms cannot grey fields out based on another field, so
-the credentials are a separate step that is only shown when anonymous is off.
+AUTH_ALLOW_ANONYMOUS in its environment; with none of them set it is open).
+sidecar_anonymous (default on) says it is running without one; otherwise a
+second screen collects the username and password so the sidebar panel can
+sign in by itself (see sidecar_auth.py). Home Assistant's forms cannot hide
+or grey fields based on another field, so the credentials are a separate step
+that is only shown when anonymous is off.
 """
 from __future__ import annotations
 
