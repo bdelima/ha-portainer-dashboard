@@ -300,38 +300,62 @@ def _stacks_with_open_trouble(hass: HomeAssistant, entity_reg: er.EntityRegistry
 
 
 # ---------------------------------------------------------------------------
-# Portainer's own container. Portainer performs every container recreate on
-# its host, so recreating ITS container from inside Portainer stops the
-# process doing the work before the replacement is started: it was observed
-# to leave Portainer stopped. Its update therefore can't be installed from
-# the dashboard; it is reported as a Needs Remediation item instead (see
-# PortainerTroubleCoordinator) and perform_update refuses it.
+# Portainer's own containers: the server and the agent. Portainer performs
+# every container recreate on a host through its server (or, for a remote
+# host, through that host's agent), so recreating one of those containers
+# from inside Portainer stops the process doing the work before the
+# replacement is started: it was observed to leave Portainer stopped. Their
+# updates therefore can't be installed from the dashboard; they are reported
+# as Needs Remediation items instead (see PortainerTroubleCoordinator) and
+# perform_update refuses them.
 # ---------------------------------------------------------------------------
 PORTAINER_SERVER_IMAGE_REPOS = frozenset({"portainer/portainer-ce", "portainer/portainer-ee"})
-_PORTAINER_SERVER_CONTAINER_NAME = "portainer"
+PORTAINER_AGENT_IMAGE_REPOS = frozenset({"portainer/agent"})
+# Only used when the container's image sensor can't say what it runs.
+_PORTAINER_FALLBACK_NAMES = {
+    "portainer": "server",
+    "portainer_agent": "agent",
+    "portainer-agent": "agent",
+}
 
 
-def _is_portainer_server_container(
+def _portainer_component(
     hass: HomeAssistant, entity_reg: er.EntityRegistry, container_device_id: str | None
-) -> bool:
-    """True when the container is Portainer itself (CE or EE). Matched on
-    the container's image repo; falls back to the container being named
-    "portainer" only when its image sensor can't say (missing, unknown,
+) -> str | None:
+    """"server" or "agent" when the container is one of Portainer's own,
+    otherwise None. Matched on the container's image repo; falls back to the
+    container's name only when its image sensor can't say (missing, unknown,
     unavailable, or a bare digest)."""
     if container_device_id is None:
-        return False
+        return None
     image_entity_id = _container_image_entity_id(hass, entity_reg, container_device_id)
     state = hass.states.get(image_entity_id) if image_entity_id else None
     image_ref = state.state if state else None
     if image_ref and image_ref not in ("unknown", "unavailable") and not _looks_like_bare_digest(image_ref):
         _host, repo = _split_image_repo(image_ref)
-        return repo is not None and repo.lower() in PORTAINER_SERVER_IMAGE_REPOS
+        repo = repo.lower() if repo else None
+        if repo in PORTAINER_SERVER_IMAGE_REPOS:
+            return "server"
+        if repo in PORTAINER_AGENT_IMAGE_REPOS:
+            return "agent"
+        return None
     device_reg = dr.async_get(hass)
     name = _device_name(device_reg, container_device_id)
-    return bool(name) and name.strip().lower() == _PORTAINER_SERVER_CONTAINER_NAME
+    return _PORTAINER_FALLBACK_NAMES.get(name.strip().lower()) if name else None
 
 
-def _portainer_self_update_detail(container_name: str, host: str) -> str:
+def _portainer_self_update_detail(container_name: str, host: str, component: str = "server") -> str:
+    if component == "agent":
+        return (
+            f"{container_name} on {host} is the Portainer agent, so it can't be updated from here: "
+            f"Portainer reaches {host} through this agent, and recreating the agent stops the "
+            "connection that is doing the recreate, which leaves it stopped. Update it on the host "
+            "instead -- pull the new image and recreate the container the way it was deployed (for "
+            "a compose file, `docker compose pull && docker compose up -d` in that file's "
+            "directory). Keep the agent on the same version as the Portainer server. "
+            f"Do any other updates on {host} first, since Portainer can't manage {host} while the "
+            "agent restarts."
+        )
     return (
         f"{container_name} on {host} is Portainer itself, so it can't be updated from here: "
         "Portainer performs every container recreate, and recreating its own container stops it "
@@ -349,7 +373,8 @@ def _dismiss_key(kind: str, identity: str) -> str:
 def _find_portainer_self_updates(
     hass: HomeAssistant, entity_reg: er.EntityRegistry, device_reg: dr.DeviceRegistry
 ) -> list[dict]:
-    """Pending update.* entities that belong to Portainer's own container."""
+    """Pending update.* entities that belong to Portainer's own containers
+    (server or agent)."""
     found: list[dict] = []
     for entity_id in _portainer_entity_ids(entity_reg):
         if not entity_id.startswith("update."):
@@ -359,7 +384,8 @@ def _find_portainer_self_updates(
             continue
         reg_entry = entity_reg.async_get(entity_id)
         device_id = reg_entry.device_id if reg_entry else None
-        if not _is_portainer_server_container(hass, entity_reg, device_id):
+        component = _portainer_component(hass, entity_reg, device_id)
+        if component is None:
             continue
         root_id = _walk_to_root(device_reg, device_id)
         host = _device_name(device_reg, root_id) or "unknown host"
@@ -373,6 +399,7 @@ def _find_portainer_self_updates(
                 "host": host,
                 "host_device_id": root_id,
                 "container_name": container_name,
+                "component": component,
                 "stack_name": _stack_info(device_reg, entity_reg, device_id)[0],
                 "stack_device_id": _stack_device_id(device_reg, device_id),
             }
@@ -847,10 +874,10 @@ class PortainerUpdatesCoordinator(DataUpdateCoordinator[list[dict]]):
 
             reg_entry = entity_reg.async_get(entity_id)
             device_id = reg_entry.device_id if reg_entry else None
-            # Portainer's own update can't be installed from here -- it is
-            # reported on the Trouble sensor instead (see
+            # Portainer's own updates (server, agent) can't be installed from
+            # here -- they are reported on the Trouble sensor instead (see
             # _find_portainer_self_updates).
-            if _is_portainer_server_container(self.hass, entity_reg, device_id):
+            if _portainer_component(self.hass, entity_reg, device_id) is not None:
                 continue
             root_id = _walk_to_root(device_reg, device_id)
             host = _device_name(device_reg, root_id) or "unknown host"
@@ -907,9 +934,11 @@ class PortainerTroubleCoordinator(DataUpdateCoordinator[list[dict]]):
         _find_stuck_containers's docstring for why this is stateless and
         needs no settle window to avoid flapping.
 
-      - Portainer's own pending update (kind="portainer_self_update"):
-        it can't be applied from here (see _is_portainer_server_container),
-        so it is listed with a `detail` string describing the manual fix.
+      - A pending update for one of Portainer's own containers, the server
+        or the agent (kind="portainer_self_update", with component="server"
+        or "agent"): it can't be applied from here (see
+        _portainer_component), so it is listed with a `detail` string
+        describing the manual fix.
 
     Items the user can't act on from the dashboard carry a `dismiss_key`
     (container_exited, container_unhealthy, unstacked_recreate,
@@ -1060,9 +1089,12 @@ class PortainerTroubleCoordinator(DataUpdateCoordinator[list[dict]]):
                     "stack_name": item["stack_name"],
                     "stack_device_id": item["stack_device_id"],
                     "name": f"{item['container_name']} ({item['host']})",
+                    "component": item["component"],
                     "secondary_info": "Update available — apply it on the host",
                     "dismiss_key": _dismiss_key("portainer_self_update", item["entity"]),
-                    "detail": _portainer_self_update_detail(item["container_name"], item["host"]),
+                    "detail": _portainer_self_update_detail(
+                        item["container_name"], item["host"], item["component"]
+                    ),
                 }
             )
 
