@@ -232,3 +232,42 @@ dismiss_trouble_item:
       example: "container_exited:3f9e1c2b4a5d6e7f8091a2b3c4d5e6f7"
       selector:
         text:
+
+update_portainer:
+  name: Update Portainer
+  description: >-
+    Updates Portainer's own server or agent container, which perform_update
+    refuses (recreating Portainer from inside Portainer stops it before the
+    replacement starts). Starts Portainer's own portainer/portainer-updater
+    helper container on the same host, with the Docker socket mounted, and
+    returns as soon as it has started -- it does not wait, because Portainer
+    is unavailable while it restarts. For the server the helper runs
+    "portainer --image=<ref>", for the agent "agent <schedule id> <ref>",
+    where <ref> is the image reference the container currently runs; the
+    helper pulls it, replaces the container with the same configuration and
+    removes itself when done. Refused unless an update is pending and the
+    container's image has an explicit tag (not a bare digest, not a digest
+    pin, not untagged). A second start for the same container within ten
+    minutes is refused. Do other updates on that host first. Returns what it
+    did (or, with dry_run, what it would do) via HA's action-response-data
+    feature. Called by the companion ha-portainer-sidecar webapp's Update
+    now button on a Portainer row in Needs Remediation; nothing calls it
+    automatically.
+  fields:
+    update_entity:
+      name: Update entity
+      description: The update.* entity of Portainer's server or agent container.
+      required: true
+      example: update.portainer_image_update
+      selector:
+        entity:
+          domain: update
+    dry_run:
+      name: Dry run
+      description: >-
+        Work out and return what would be run (target image, helper
+        command, endpoint and container ids) without calling Portainer.
+      required: false
+      default: false
+      selector:
+        boolean:
