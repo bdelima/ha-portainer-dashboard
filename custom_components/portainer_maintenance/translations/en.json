@@ -12,7 +12,7 @@
         },
         "data_description": {
           "admin_only": "Hide the sidebar panel from non-administrator users. This only hides the panel inside Home Assistant; it does not control who can open the webapp's own URL.",
-          "sidecar_anonymous": "Turn on only if the sidecar runs with AUTH_ALLOW_ANONYMOUS=true. Leave it off and the next screen asks for the username and password you gave the sidecar as AUTH_USERNAME and AUTH_PASSWORD, so the sidebar panel can sign in by itself."
+          "sidecar_anonymous": "Leave this ticked if the sidecar has no sign-in (it has none unless you set AUTH_USERNAME and AUTH_PASSWORD). Untick it if the sidecar does have one: the next screen asks for that username and password so the sidebar panel can sign in by itself."
         }
       },
       "reconfigure": {
@@ -26,7 +26,7 @@
         },
         "data_description": {
           "admin_only": "Hide the sidebar panel from non-administrator users. This only hides the panel inside Home Assistant; it does not control who can open the webapp's own URL.",
-          "sidecar_anonymous": "Turn on only if the sidecar runs with AUTH_ALLOW_ANONYMOUS=true. Leave it off and the next screen asks for the username and password you gave the sidecar as AUTH_USERNAME and AUTH_PASSWORD, so the sidebar panel can sign in by itself."
+          "sidecar_anonymous": "Leave this ticked if the sidecar has no sign-in (it has none unless you set AUTH_USERNAME and AUTH_PASSWORD). Untick it if the sidecar does have one: the next screen asks for that username and password so the sidebar panel can sign in by itself."
         }
       },
       "sidecar_login": {
