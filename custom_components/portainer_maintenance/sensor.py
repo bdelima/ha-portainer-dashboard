@@ -1080,6 +1080,9 @@ class PortainerTroubleCoordinator(DataUpdateCoordinator[list[dict]]):
                     "name": f"{item['container_name']} ({item['host']})",
                     "component": item["component"],
                     "secondary_info": "Update available — apply it on the host",
+                    # Tells a front end that portainer_maintenance.update_portainer
+                    # exists in this version of the integration.
+                    "update_now": True,
                     "dismiss_key": _dismiss_key("portainer_self_update", item["entity"]),
                     "detail": _portainer_self_update_detail(
                         item["container_name"], item["host"], item["component"]
