@@ -10,11 +10,12 @@ CONF_ADMIN_ONLY = "admin_only"
 DEFAULT_ADMIN_ONLY = True
 
 # Sign-in for the sidecar webapp (its AUTH_USERNAME / AUTH_PASSWORD /
-# AUTH_ALLOW_ANONYMOUS). Off by default, to match the sidecar failing closed.
+# AUTH_ALLOW_ANONYMOUS). On by default, to match the sidecar, which is open until
+# it is given credentials.
 CONF_SIDECAR_ANONYMOUS = "sidecar_anonymous"
 CONF_SIDECAR_USERNAME = "sidecar_username"
 CONF_SIDECAR_PASSWORD = "sidecar_password"
-DEFAULT_SIDECAR_ANONYMOUS = False
+DEFAULT_SIDECAR_ANONYMOUS = True
 
 PANEL_PATH = "portainer-actions"
 PANEL_TITLE = "Portainer Maintenance"
