@@ -9,6 +9,13 @@ CONF_ADMIN_ONLY = "admin_only"
 # existed gets.
 DEFAULT_ADMIN_ONLY = True
 
+# Sign-in for the sidecar webapp (its AUTH_USERNAME / AUTH_PASSWORD /
+# AUTH_ALLOW_ANONYMOUS). Off by default, to match the sidecar failing closed.
+CONF_SIDECAR_ANONYMOUS = "sidecar_anonymous"
+CONF_SIDECAR_USERNAME = "sidecar_username"
+CONF_SIDECAR_PASSWORD = "sidecar_password"
+DEFAULT_SIDECAR_ANONYMOUS = False
+
 PANEL_PATH = "portainer-actions"
 PANEL_TITLE = "Portainer Maintenance"
 PANEL_ICON = "mdi:docker"
