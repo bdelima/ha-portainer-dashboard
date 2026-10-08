@@ -137,6 +137,7 @@ from .sensor import (
     _stack_info,
     _walk_to_root,
 )
+from .sidecar_auth import panel_url
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -1165,8 +1166,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     # Entries created before CONF_ADMIN_ONLY existed don't carry the key; they
     # get the default (administrators only) until reconfigured.
+    # The sidecar's sign-in token rides in the panel URL (see sidecar_auth.py);
+    # nothing here logs that URL.
     _register_panel(
-        hass, webapp_url, bool(entry.data.get(CONF_ADMIN_ONLY, DEFAULT_ADMIN_ONLY))
+        hass,
+        panel_url(webapp_url, entry.data),
+        bool(entry.data.get(CONF_ADMIN_ONLY, DEFAULT_ADMIN_ONLY)),
     )
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
