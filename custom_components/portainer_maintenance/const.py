@@ -9,8 +9,18 @@ CONF_ADMIN_ONLY = "admin_only"
 # existed gets.
 DEFAULT_ADMIN_ONLY = True
 
+# Sign-in for the sidecar webapp (its AUTH_USERNAME / AUTH_PASSWORD /
+# AUTH_ALLOW_ANONYMOUS). On by default, to match the sidecar, which is open until
+# it is given credentials.
+CONF_SIDECAR_ANONYMOUS = "sidecar_anonymous"
+CONF_SIDECAR_USERNAME = "sidecar_username"
+CONF_SIDECAR_PASSWORD = "sidecar_password"
+DEFAULT_SIDECAR_ANONYMOUS = True
+
 PANEL_PATH = "portainer-actions"
-PANEL_TITLE = "Portainer Maintenance"
+# What the sidebar entry is called (the integration itself is still named
+# "Portainer Maintenance").
+PANEL_TITLE = "Portainer"
 PANEL_ICON = "mdi:docker"
 
 SENSOR_UPDATES_PENDING = "portainer_updates_pending"

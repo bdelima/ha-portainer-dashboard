@@ -7,10 +7,12 @@
         "data": {
           "webapp_url": "Webapp URL",
           "notify_devices": "Notify device(s)",
-          "admin_only": "Administrators only"
+          "admin_only": "Administrators only",
+          "sidecar_anonymous": "Sidecar allows anonymous access"
         },
         "data_description": {
-          "admin_only": "Hide the sidebar panel from non-administrator users. This only hides the panel inside Home Assistant; it does not control who can open the webapp's own URL."
+          "admin_only": "Hide the sidebar panel from non-administrator users. This only hides the panel inside Home Assistant; it does not control who can open the webapp's own URL.",
+          "sidecar_anonymous": "Leave this ticked if the sidecar has no sign-in (it has none unless you set AUTH_USERNAME and AUTH_PASSWORD). Untick it if the sidecar does have one: the next screen asks for that username and password so the sidebar panel can sign in by itself."
         }
       },
       "reconfigure": {
@@ -19,12 +21,41 @@
         "data": {
           "webapp_url": "Webapp URL",
           "notify_devices": "Notify device(s)",
-          "admin_only": "Administrators only"
+          "admin_only": "Administrators only",
+          "sidecar_anonymous": "Sidecar allows anonymous access"
         },
         "data_description": {
-          "admin_only": "Hide the sidebar panel from non-administrator users. This only hides the panel inside Home Assistant; it does not control who can open the webapp's own URL."
+          "admin_only": "Hide the sidebar panel from non-administrator users. This only hides the panel inside Home Assistant; it does not control who can open the webapp's own URL.",
+          "sidecar_anonymous": "Leave this ticked if the sidecar has no sign-in (it has none unless you set AUTH_USERNAME and AUTH_PASSWORD). Untick it if the sidecar does have one: the next screen asks for that username and password so the sidebar panel can sign in by itself."
+        }
+      },
+      "sidecar_login": {
+        "title": "Portainer Maintenance: sidecar sign-in",
+        "description": "Enter the username and password the sidecar webapp is configured with (AUTH_USERNAME and AUTH_PASSWORD in its compose file). The sidebar panel uses them to sign in without asking.",
+        "data": {
+          "sidecar_username": "Sidecar username",
+          "sidecar_password": "Sidecar password"
+        },
+        "data_description": {
+          "sidecar_username": "The same value as the sidecar's AUTH_USERNAME.",
+          "sidecar_password": "The same value as the sidecar's AUTH_PASSWORD. Stored in this integration's config entry and used to build a sign-in token for the sidebar panel's URL."
+        }
+      },
+      "reconfigure_login": {
+        "title": "Portainer Maintenance: sidecar sign-in",
+        "description": "Enter the username and password the sidecar webapp is configured with (AUTH_USERNAME and AUTH_PASSWORD in its compose file). The sidebar panel uses them to sign in without asking.",
+        "data": {
+          "sidecar_username": "Sidecar username",
+          "sidecar_password": "Sidecar password"
+        },
+        "data_description": {
+          "sidecar_username": "The same value as the sidecar's AUTH_USERNAME.",
+          "sidecar_password": "The same value as the sidecar's AUTH_PASSWORD. Stored in this integration's config entry and used to build a sign-in token for the sidebar panel's URL."
         }
       }
+    },
+    "error": {
+      "credentials_required": "Enter both a username and a password."
     },
     "abort": {
       "already_configured": "Portainer Maintenance is already set up.",
