@@ -244,10 +244,12 @@ update_portainer:
     helper container on the same host, with the Docker socket mounted, and
     returns as soon as it has started -- it does not wait, because Portainer
     is unavailable while it restarts. The helper image is the
-    portainer-updater tagged with the version the container is running now
-    (read from the container's org.opencontainers.image.version label, the
-    "image version" sensor on its device), never :latest, which is a 2024
-    build; the call is refused when that version can't be read. For the
+    portainer-updater tagged with the version Portainer reports it is running
+    now (one read of the Portainer API's system/status; for the agent that is
+    the server's version, which agents are meant to match), never :latest,
+    which is a 2024 build. When that version can't be read cleanly nothing is
+    started, and the error says to update by hand (Portainer's own update
+    prompt, or pull the image and recreate the container). For the
     server the helper runs "portainer --image=<ref>", for the agent
     "agent <schedule id> <ref>", where <ref> is the image reference the
     container currently runs; the helper pulls it, replaces the container
@@ -277,7 +279,9 @@ update_portainer:
       name: Dry run
       description: >-
         Work out and return what would be run (target image, helper
-        command, endpoint and container ids) without calling Portainer.
+        command, endpoint and container ids) without starting anything.
+        Reads the Portainer version once (system/status), so it also shows
+        whether that version can be read.
       required: false
       default: false
       selector:
