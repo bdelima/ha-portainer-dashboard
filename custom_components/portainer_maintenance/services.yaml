@@ -5,8 +5,10 @@ remove_device:
     Portainer devices/stacks that Portainer's own HA integration doesn't
     clean up on its own (a confirmed open bug: home-assistant/core#155548).
     This deletes the device outright -- there is no undo. Intended for
-    devices already confirmed stale (all entities unavailable for 12+ hours
-    while the host endpoint is healthy), not general-purpose device removal.
+    devices already confirmed stale (Portainer no longer lists them while the
+    host endpoint is healthy), not general-purpose device removal. Home
+    Assistant's Portainer integration re-creates the device and its entities
+    on its own if the container or stack comes back.
   fields:
     device_id:
       name: Device
