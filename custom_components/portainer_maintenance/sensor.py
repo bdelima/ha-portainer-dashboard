@@ -21,8 +21,11 @@ from __future__ import annotations
 
 import json
 import logging
+import asyncio
 import re
+import time
 from collections.abc import Mapping
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -351,30 +354,90 @@ def _portainer_component(
     return _PORTAINER_FALLBACK_NAMES.get(name.strip().lower()) if name else None
 
 
-def _portainer_self_update_detail(container_name: str, host: str, component: str = "server") -> str:
-    if component == "agent":
+def _portainer_subject(host: str, component: str) -> str:
+    return f"Portainer agent on {host}" if component == "agent" else f"Portainer on {host}"
+
+
+_PORTAINER_RESTART_NOTE = (
+    "Be aware that updating Portainer will make it briefly unavailable, so other update or "
+    "cleanup actions will not be possible until Portainer restarts."
+)
+_PORTAINER_MANUAL_STEPS = (
+    "Update must be performed on the host instead -- pull the new image and recreate the "
+    "container from the compose file it was deployed with (`docker compose pull && "
+    "docker compose up -d` in that file's directory)."
+)
+
+
+def _portainer_self_update_detail(
+    host: str, component: str = "server", mode: str = "manual", reason: str | None = None,
+    started: str | None = None,
+) -> str:
+    """The More Info text for a Portainer self-update row. mode is
+    "possible" (Update now works), "manual" (the dashboard can't do it),
+    "failed" (it was tried and didn't work; `reason` says what was seen) or
+    "running" (in progress since `started`). The agent only changes the
+    subject."""
+    subject = _portainer_subject(host, component)
+    if mode == "possible":
         return (
-            f"{container_name} on {host} is the Portainer agent, so it can't be updated from here: "
-            f"Portainer reaches {host} through this agent, and recreating the agent stops the "
-            "connection that is doing the recreate, which leaves it stopped. Update it on the host "
-            "instead -- pull the new image and recreate the container the way it was deployed (for "
-            "a compose file, `docker compose pull && docker compose up -d` in that file's "
-            "directory). Keep the agent on the same version as the Portainer server. "
-            f"Do any other updates on {host} first, since Portainer can't manage {host} while the "
-            "agent restarts."
+            f"{subject} has a pending update. Update now starts Portainer's updater on that "
+            f"host. {_PORTAINER_RESTART_NOTE}"
+        )
+    if mode == "running":
+        return (
+            f"{subject} is being updated by Portainer's updater (started {started}). "
+            f"Portainer is briefly unavailable while it restarts, so other update or cleanup "
+            "actions will not be possible until it is back. This row shows how it is going."
+        )
+    if mode == "failed":
+        return (
+            f"Updating {subject} from here did not work: {reason} "
+            f"{_PORTAINER_MANUAL_STEPS} {_PORTAINER_RESTART_NOTE}"
         )
     return (
-        f"{container_name} on {host} is Portainer itself, so it can't be updated from here: "
-        "Portainer performs every container recreate, and recreating its own container stops it "
-        "before the replacement is started, which leaves it stopped. Update it on the host "
-        "instead -- pull the new image and recreate the container from the compose file it was "
-        "deployed with (`docker compose pull && docker compose up -d` in that file's directory). "
-        f"Do any other updates on {host} first, since Portainer is unavailable while it restarts."
+        f"{subject} has a pending update, but is in a state that doesn't allow programmatic "
+        f"updates. {_PORTAINER_MANUAL_STEPS} {_PORTAINER_RESTART_NOTE}"
     )
 
 
 def _dismiss_key(kind: str, identity: str) -> str:
     return f"{kind}:{identity}"
+
+
+def _self_update_item(
+    hass: HomeAssistant,
+    entity_reg: er.EntityRegistry,
+    device_reg: dr.DeviceRegistry,
+    entity_id: str,
+    component: str | None = None,
+) -> dict | None:
+    """The description of a Portainer server/agent update entity, or None when
+    the entity isn't one. `component` can be passed when the caller already
+    knows it (the image sensor that normally tells can be unavailable while
+    Portainer restarts)."""
+    state = hass.states.get(entity_id)
+    reg_entry = entity_reg.async_get(entity_id)
+    device_id = reg_entry.device_id if reg_entry else None
+    if component is None:
+        component = _portainer_component(hass, entity_reg, device_id)
+    if component is None:
+        return None
+    root_id = _walk_to_root(device_reg, device_id)
+    host = _device_name(device_reg, root_id) or "unknown host"
+    container_name = _device_name(device_reg, device_id) or (
+        state.attributes.get("friendly_name", entity_id) if state else entity_id
+    )
+    return {
+        "entity": entity_id,
+        "device_id": device_id,
+        "host": host,
+        "host_device_id": root_id,
+        "container_name": container_name,
+        "component": component,
+        "stack_name": _stack_info(device_reg, entity_reg, device_id)[0],
+        "stack_device_id": _stack_device_id(device_reg, device_id),
+    }
 
 
 def _find_portainer_self_updates(
@@ -389,29 +452,120 @@ def _find_portainer_self_updates(
         state = hass.states.get(entity_id)
         if state is None or state.state != "on":
             continue
-        reg_entry = entity_reg.async_get(entity_id)
-        device_id = reg_entry.device_id if reg_entry else None
-        component = _portainer_component(hass, entity_reg, device_id)
-        if component is None:
-            continue
-        root_id = _walk_to_root(device_reg, device_id)
-        host = _device_name(device_reg, root_id) or "unknown host"
-        container_name = _device_name(device_reg, device_id) or state.attributes.get(
-            "friendly_name", entity_id
-        )
-        found.append(
-            {
-                "entity": entity_id,
-                "device_id": device_id,
-                "host": host,
-                "host_device_id": root_id,
-                "container_name": container_name,
-                "component": component,
-                "stack_name": _stack_info(device_reg, entity_reg, device_id)[0],
-                "stack_device_id": _stack_device_id(device_reg, device_id),
-            }
-        )
+        item = _self_update_item(hass, entity_reg, device_reg, entity_id)
+        if item is not None:
+            found.append(item)
     return found
+
+
+# ---------------------------------------------------------------------------
+# Updating Portainer's own server/agent from the dashboard, and following the
+# update. The update itself is started by __init__.py's update_portainer
+# service (a short-lived portainer-updater helper container). Portainer is
+# unavailable while it runs, so the result is judged here, from what core's
+# Portainer integration is seen to report, and never guessed.
+# ---------------------------------------------------------------------------
+CORE_PORTAINER_DOMAIN = "portainer"
+# Reading Portainer's version (to know which updater image fits) must not
+# hold up the Trouble refresh when Portainer is slow or down.
+SELF_UPDATE_VERSION_TIMEOUT_SECONDS = 5
+# Trouble refresh interval while an update is being followed.
+SELF_UPDATE_FAST_INTERVAL = timedelta(seconds=10)
+TROUBLE_INTERVAL = timedelta(minutes=1)
+# How long to wait for a verdict, from the helper's start. Without
+# --health-check the updater's own checks last well under a minute; with it the
+# updater retries "/portainer --health-check" for up to about 2.75 hours, and
+# then spends up to 5 minutes rolling the database back.
+SELF_UPDATE_CEILING_SECONDS = 5 * 60
+SELF_UPDATE_HEALTH_CHECK_CEILING_SECONDS = 3 * 3600
+# After the new container is seen, how long to wait for core's update entity
+# to turn off before the row stops claiming to be confirming.
+SELF_UPDATE_CONFIRM_SECONDS = 15 * 60
+# Consecutive new snapshots of core's data that must all show "updater gone,
+# old container still current" before that is called a failure.
+SELF_UPDATE_GONE_SNAPSHOTS = 2
+
+
+def _core_container_view(
+    hass: HomeAssistant, device_reg: dr.DeviceRegistry, container_device_id: str | None
+) -> tuple[Any, Any, Any] | None:
+    """(core coordinator, its endpoint data, its data for the container) for a
+    container device, or None when core doesn't currently list it."""
+    device = device_reg.async_get(container_device_id) if container_device_id else None
+    if device is None:
+        return None
+    for core_entry in hass.config_entries.async_entries(CORE_PORTAINER_DOMAIN):
+        coordinator = getattr(core_entry, "runtime_data", None)
+        if coordinator is None or not getattr(coordinator, "data", None):
+            continue
+        for data in coordinator.data.values():
+            for container_name, container_data in data.containers.items():
+                identifier = (
+                    CORE_PORTAINER_DOMAIN,
+                    f"{core_entry.entry_id}_{data.endpoint.id}_{container_name}",
+                )
+                if identifier in device.identifiers:
+                    return coordinator, data, container_data
+    return None
+
+
+async def _self_update_possible(
+    hass: HomeAssistant, device_reg: dr.DeviceRegistry, entity_reg: er.EntityRegistry, item: dict
+) -> bool:
+    """Whether update_portainer can work for this item right now: the
+    container has a usable image tag, and the running Portainer version
+    can be read as a plain x.y.z (one system/status request, cut off after
+    SELF_UPDATE_VERSION_TIMEOUT_SECONDS) to pick the matching updater image.
+    The agent is judged by the server version core talks to."""
+    from . import _PLAIN_VERSION_RE, _updater_target_image  # circular at import time
+
+    image_entity_id = _container_image_entity_id(hass, entity_reg, item["device_id"])
+    image_state = hass.states.get(image_entity_id) if image_entity_id else None
+    try:
+        _updater_target_image(
+            image_state.state if image_state else None, item["container_name"], item["host"]
+        )
+    except Exception:  # noqa: BLE001 - HomeAssistantError: no usable tag
+        return False
+    view = _core_container_view(hass, device_reg, item["device_id"])
+    if view is None:
+        return False
+    try:
+        async with asyncio.timeout(SELF_UPDATE_VERSION_TIMEOUT_SECONDS):
+            status = await view[0].portainer.portainer_system_status()
+    except Exception:  # noqa: BLE001 - any failure, timeout included, means "can't tell"
+        return False
+    return bool(_PLAIN_VERSION_RE.match((getattr(status, "version", None) or "").strip()))
+
+
+@dataclass
+class _UpdateRecord:
+    """One update_portainer run being followed."""
+
+    entity: str
+    device_id: str
+    component: str
+    container_id: str  # Portainer's container id when the helper started
+    helper_id: str
+    helper_name: str
+    health_check: bool
+    started_at: datetime
+    started_mono: float
+    start_data: Any = None  # core's coordinator data when the helper started
+    start_time: Any = None
+    last_data: Any = None
+    last_time: Any = None
+    fresh: int = 0  # core refreshes seen since the start
+    helper_seen: bool = False
+    gone_streak: int = 0
+    replaced_mono: float | None = None
+    state: str = "updating"  # updating | confirming | failed
+    progress: str = ""
+    reason: str = ""
+
+
+def _fmt_duration(seconds: float) -> str:
+    return f"{int(seconds // 3600)} hours" if seconds >= 3600 else f"{int(seconds // 60)} minutes"
 
 
 # ---------------------------------------------------------------------------
@@ -458,11 +612,11 @@ def _endpoint_unavailable_since(
 def _device_entity_by_suffix(entity_reg: er.EntityRegistry, device_id: str, domain_prefix: str, suffixes: tuple[str, ...]) -> str | None:
     """First entity on a device whose entity_id starts with domain_prefix
     (e.g. "sensor." or "button.") and ends with one of the given suffixes.
-    Suffix-matching, same pragmatic approach _container_image_entity_id
-    and _container_state_entity_id already use, since object_ids can shift
-    slightly across pyportainer/core releases (e.g. "_images_count" vs
-    "_image_count") -- worth confirming the exact suffix against a live
-    instance if a Cleanup badge ever reads consistently empty."""
+    Only the fallback for _device_entity_by_key below: an entity_id is built
+    from the entity's display name ("Volume disk usage total size" gives
+    `_volume_disk_usage_total_size`, "Prune unused volumes" gives
+    `_prune_unused_volumes`), not from core's internal key, and a rename
+    changes it."""
     for entity in er.async_entries_for_device(entity_reg, device_id):
         if not entity.entity_id.startswith(domain_prefix):
             continue
@@ -472,32 +626,61 @@ def _device_entity_by_suffix(entity_reg: er.EntityRegistry, device_id: str, doma
     return None
 
 
+def _device_entity_by_key(
+    entity_reg: er.EntityRegistry,
+    device_id: str,
+    domain_prefix: str,
+    translation_keys: tuple[str, ...],
+    suffixes: tuple[str, ...],
+) -> str | None:
+    """The entity on a device that core's Portainer integration created with
+    one of these translation keys (the `translation_key` in its entity
+    descriptions, kept in the entity registry), else the first whose entity_id
+    ends in one of the suffixes. The key is what the entity IS, so it keeps
+    working when an entity is renamed or core rewords its display name; the
+    suffixes are the fallback for a registry entry without one. Matching
+    entity_ids alone is why volume usage and the volume prune button were
+    never found: the dashboard looked for `_volume_disk_usage_total` and
+    `_volumes_prune`, but the entity_ids end `_volume_disk_usage_total_size`
+    and `_prune_unused_volumes`."""
+    for entity in er.async_entries_for_device(entity_reg, device_id):
+        if not entity.entity_id.startswith(domain_prefix):
+            continue
+        if getattr(entity, "translation_key", None) in translation_keys:
+            return entity.entity_id
+    return _device_entity_by_suffix(entity_reg, device_id, domain_prefix, suffixes)
+
+
 def _endpoint_images_count_entity(entity_reg: er.EntityRegistry, device_id: str) -> str | None:
-    return _device_entity_by_suffix(entity_reg, device_id, "sensor.", ("_images_count", "_image_count"))
+    return _device_entity_by_key(entity_reg, device_id, "sensor.", ("images_count",), ("_images_count", "_image_count"))
 
 
 def _endpoint_containers_count_entity(entity_reg: er.EntityRegistry, device_id: str) -> str | None:
-    return _device_entity_by_suffix(entity_reg, device_id, "sensor.", ("_containers_count", "_container_count"))
+    return _device_entity_by_key(entity_reg, device_id, "sensor.", ("containers_count",), ("_containers_count", "_container_count"))
 
 
 def _endpoint_reclaimable_entity(entity_reg: er.EntityRegistry, device_id: str) -> str | None:
-    return _device_entity_by_suffix(entity_reg, device_id, "sensor.", ("_image_disk_usage_reclaimable",))
+    return _device_entity_by_key(entity_reg, device_id, "sensor.", ("image_disk_usage_reclaimable",), ("_image_disk_usage_reclaimable",))
 
 
 def _endpoint_volume_usage_entity(entity_reg: er.EntityRegistry, device_id: str) -> str | None:
-    return _device_entity_by_suffix(entity_reg, device_id, "sensor.", ("_volume_disk_usage_total",))
+    return _device_entity_by_key(
+        entity_reg,
+        device_id,
+        "sensor.",
+        ("volume_disk_usage_total_size",),
+        ("_volume_disk_usage_total_size", "_volume_disk_usage_total"),
+    )
 
 
 def _endpoint_volumes_prune_button(entity_reg: er.EntityRegistry, device_id: str) -> str | None:
-    return _device_entity_by_suffix(entity_reg, device_id, "button.", ("_volumes_prune",))
+    return _device_entity_by_key(entity_reg, device_id, "button.", ("volumes_prune",), ("_prune_unused_volumes", "_volumes_prune"))
 
 
 def _numeric_state(hass: HomeAssistant, entity_id: str | None) -> float | None:
-    """A sensor's numeric value, or None for missing/unknown/unavailable --
-    disk-usage sensors (backed by a separate coordinator from the main
-    endpoint data) have been observed inconsistently `unknown` on some
-    hosts, so every caller of this must treat None as "no number to show,"
-    never math on it or format it as 0."""
+    """A sensor's numeric value, or None for missing/unknown/unavailable.
+    Used for the image and container counts, where None means "can't tell"
+    (see _size_state for the disk-usage sensors, where Unknown means 0)."""
     if entity_id is None:
         return None
     state = hass.states.get(entity_id)
@@ -507,6 +690,32 @@ def _numeric_state(hass: HomeAssistant, entity_id: str | None) -> float | None:
         return float(state.state)
     except (TypeError, ValueError):
         return None
+
+
+def _size_state(hass: HomeAssistant, entity_id: str | None) -> tuple[float | None, bool]:
+    """(value, unavailable) for one of core's disk-usage sensors.
+
+    Core reports Unknown for these when there is nothing to report: the image
+    "reclaimable" figure when no image is unused, the volume total on a host
+    with no volumes. That is 0, so Unknown gives 0.0. Unavailable means the
+    state is not known (Portainer unreachable, the entity not loaded), which
+    is not 0: it gives (None, True), so a caller can refuse to offer an action
+    on it. No such entity (disabled or never created) gives (None, False), and
+    the caller decides what that means. A state that isn't a number gives
+    (None, False)."""
+    if entity_id is None:
+        return None, False
+    state = hass.states.get(entity_id)
+    if state is None:
+        return None, False
+    if state.state == "unavailable":
+        return None, True
+    if state.state in (None, "unknown"):
+        return 0.0, False
+    try:
+        return float(state.state), False
+    except (TypeError, ValueError):
+        return None, False
 
 
 # ---------------------------------------------------------------------------
@@ -932,9 +1141,14 @@ class PortainerTroubleCoordinator(DataUpdateCoordinator[list[dict]]):
 
       - A pending update for one of Portainer's own containers, the server
         or the agent (kind="portainer_self_update", with component="server"
-        or "agent"): it can't be applied from here (see
-        _portainer_component), so it is listed with a `detail` string
-        describing the manual fix.
+        or "agent"): carries `update_now` (true when update_portainer can
+        run: a usable image tag, and a Portainer version read from
+        system/status within a few seconds), and a `detail` string for the
+        More Info dialog. After update_portainer starts, the item is followed
+        (see _observe_update): `update_state` is "updating" with the observed
+        progress in `secondary_info`, or "failed" with the reason there and
+        the manual steps in `detail`. The Trouble sensor refreshes every 10 s
+        while an update is being followed.
 
     Items the user can't act on from the dashboard carry a `dismiss_key`
     (container_exited, container_unhealthy, unstacked_recreate,
@@ -945,14 +1159,152 @@ class PortainerTroubleCoordinator(DataUpdateCoordinator[list[dict]]):
     """
 
     def __init__(self, hass: HomeAssistant, dismissals: DismissalStore | None = None) -> None:
-        super().__init__(hass, _LOGGER, name=SENSOR_TROUBLE, update_interval=timedelta(minutes=1))
+        super().__init__(hass, _LOGGER, name=SENSOR_TROUBLE, update_interval=TROUBLE_INTERVAL)
         self._dismissals = dismissals
+        # update_portainer runs being followed, by update entity id. In
+        # memory only: after a Home Assistant restart a row shows its plain
+        # "Update available" state again.
+        self.updates: dict[str, _UpdateRecord] = {}
         # Items the last update left out because they are dismissed, so
         # sensor.portainer_trouble can show what is currently hidden (its
         # `dismissed_items` attribute). A dismissed item whose condition has
         # since cleared is not in this list: it only lists what would
         # otherwise be showing right now.
         self.suppressed: list[dict] = []
+
+    def start_update_tracking(
+        self,
+        *,
+        entity: str,
+        device_id: str,
+        component: str,
+        container_id: str,
+        helper_id: str,
+        helper_name: str,
+        health_check: bool,
+        core_coordinator: Any = None,
+    ) -> None:
+        """Called by update_portainer once the helper container is running:
+        follow the update from here, and refresh quickly while doing so."""
+        rec = _UpdateRecord(
+            entity=entity,
+            device_id=device_id,
+            component=component,
+            container_id=container_id,
+            helper_id=helper_id,
+            helper_name=helper_name,
+            health_check=health_check,
+            started_at=dt_util.utcnow(),
+            started_mono=time.monotonic(),
+            start_data=getattr(core_coordinator, "data", None),
+            start_time=getattr(core_coordinator, "last_update_success_time", None),
+        )
+        rec.last_data, rec.last_time = rec.start_data, rec.start_time
+        rec.progress = f"Updater started {dt_util.as_local(rec.started_at).strftime('%H:%M')}"
+        self.updates[entity] = rec
+        self.update_interval = SELF_UPDATE_FAST_INTERVAL
+
+    def is_update_tracked(self, entity: str) -> bool:
+        rec = self.updates.get(entity)
+        return rec is not None and rec.state in ("updating", "confirming")
+
+    def _fail_update(self, rec: _UpdateRecord, reason: str) -> None:
+        rec.state, rec.reason = "failed", reason
+        _LOGGER.warning(
+            "%s: update of %s (updater %s) failed: %s", SENSOR_TROUBLE, rec.entity,
+            rec.helper_name, reason,
+        )
+
+    def _observe_update(self, rec: _UpdateRecord, device_reg: dr.DeviceRegistry) -> bool:
+        """Look at what core's Portainer integration reports now and move the
+        record along. False when the record is finished and should be dropped.
+
+        Only observations count: the new container id, the helper container
+        gone from core's list, Portainer reachable or not, how much time has
+        passed. A start with --health-check is not a success until the helper
+        is gone, because the helper is what runs that check."""
+        now = time.monotonic()
+        entity_state = self.hass.states.get(rec.entity)
+        ent = entity_state.state if entity_state is not None else None
+
+        view = _core_container_view(self.hass, device_reg, rec.device_id)
+        reachable = False
+        container_now = None
+        helper_present = False
+        new_snapshot = False
+        if view is not None:
+            core, endpoint_data, container_data = view
+            ok = bool(getattr(core, "last_update_success", False))
+            reachable = ok and ent not in (None, "unavailable")
+            container_now = container_data.container.id
+            if ok:
+                data_now = core.data
+                time_now = getattr(core, "last_update_success_time", None)
+                if data_now is not rec.last_data or time_now != rec.last_time:
+                    rec.last_data, rec.last_time = data_now, time_now
+                    if data_now is not rec.start_data or time_now != rec.start_time:
+                        rec.fresh += 1
+                        new_snapshot = True
+            for name, other in endpoint_data.containers.items():
+                other_id = getattr(getattr(other, "container", None), "id", None)
+                if name == rec.helper_name or other_id == rec.helper_id:
+                    helper_present = True
+                    break
+        if helper_present:
+            rec.helper_seen = True
+        helper_gone = (
+            view is not None and reachable and not helper_present
+            and (rec.helper_seen or rec.fresh >= 2)
+        )
+        replaced = reachable and (
+            (container_now is not None and container_now != rec.container_id) or ent == "off"
+        )
+
+        if rec.state == "confirming":
+            if ent == "off" or now - (rec.replaced_mono or now) > SELF_UPDATE_CONFIRM_SECONDS:
+                return False
+            return True
+        if rec.state == "failed":
+            return not (replaced or ent == "off")
+
+        if replaced and (not rec.health_check or helper_gone):
+            if ent == "off":
+                return False
+            rec.state, rec.replaced_mono = "confirming", now
+            rec.progress = "Updated, waiting for Home Assistant to confirm"
+            return True
+
+        if replaced:
+            rec.progress = "New Portainer is running, the updater is still checking it"
+        elif not reachable:
+            rec.progress = "Portainer is restarting"
+        else:
+            rec.progress = f"Updater started {dt_util.as_local(rec.started_at).strftime('%H:%M')}"
+
+        if helper_gone and not replaced:
+            if new_snapshot:
+                rec.gone_streak += 1
+            if rec.gone_streak >= SELF_UPDATE_GONE_SNAPSHOTS:
+                self._fail_update(
+                    rec, "The updater has finished, but Portainer is still running its old container."
+                )
+                return True
+        else:
+            rec.gone_streak = 0
+
+        ceiling = (
+            SELF_UPDATE_HEALTH_CHECK_CEILING_SECONDS if rec.health_check
+            else SELF_UPDATE_CEILING_SECONDS
+        )
+        if now - rec.started_mono > ceiling:
+            wait = _fmt_duration(ceiling)
+            self._fail_update(
+                rec,
+                f"Portainer has not come back {wait} after the updater started -- check the host."
+                if not reachable
+                else f"The update had not finished {wait} after the updater started.",
+            )
+        return True
 
     async def _async_update_data(self) -> list[dict]:
         entity_reg = er.async_get(self.hass)
@@ -1080,28 +1432,68 @@ class PortainerTroubleCoordinator(DataUpdateCoordinator[list[dict]]):
                 )
 
         # -- Portainer's own pending update --------------------------------
-        for item in _find_portainer_self_updates(self.hass, entity_reg, device_reg):
-            found.append(
-                {
-                    "kind": "portainer_self_update",
-                    "entity": item["entity"],
-                    "device_id": item["device_id"],
-                    "host": item["host"],
-                    "host_device_id": item["host_device_id"],
-                    "stack_name": item["stack_name"],
-                    "stack_device_id": item["stack_device_id"],
-                    "name": f"{item['container_name']} ({item['host']})",
-                    "component": item["component"],
-                    "secondary_info": "Update available — apply it on the host",
-                    # Tells a front end that portainer_maintenance.update_portainer
-                    # exists in this version of the integration.
-                    "update_now": True,
-                    "dismiss_key": _dismiss_key("portainer_self_update", item["entity"]),
-                    "detail": _portainer_self_update_detail(
-                        item["container_name"], item["host"], item["component"]
-                    ),
-                }
+        discovered = {
+            i["entity"]: i for i in _find_portainer_self_updates(self.hass, entity_reg, device_reg)
+        }
+        for entity_id, rec in list(self.updates.items()):
+            if not self._observe_update(rec, device_reg):
+                del self.updates[entity_id]
+        for entity_id in list(discovered) + [e for e in self.updates if e not in discovered]:
+            rec = self.updates.get(entity_id)
+            item = discovered.get(entity_id) or _self_update_item(
+                self.hass, entity_reg, device_reg, entity_id, rec.component if rec else None
             )
+            if item is None:
+                continue
+            row = {
+                "kind": "portainer_self_update",
+                "entity": item["entity"],
+                "device_id": item["device_id"],
+                "host": item["host"],
+                "host_device_id": item["host_device_id"],
+                "stack_name": item["stack_name"],
+                "stack_device_id": item["stack_device_id"],
+                "name": f"{item['container_name']} ({item['host']})",
+                "component": item["component"],
+            }
+            if rec is not None and rec.state == "failed":
+                row.update(
+                    secondary_info=rec.reason,
+                    update_state="failed",
+                    update_now=False,
+                    dismiss_key=_dismiss_key("portainer_self_update", item["entity"]),
+                    detail=_portainer_self_update_detail(
+                        item["host"], item["component"], "failed", rec.reason
+                    ),
+                )
+            elif rec is not None:
+                row.update(
+                    secondary_info=rec.progress,
+                    update_state="updating",
+                    update_now=False,
+                    detail=_portainer_self_update_detail(
+                        item["host"], item["component"], "running",
+                        started=dt_util.as_local(rec.started_at).strftime("%H:%M"),
+                    ),
+                )
+            else:
+                possible = await _self_update_possible(self.hass, device_reg, entity_reg, item)
+                row.update(
+                    secondary_info="Update available — apply it on the host",
+                    # Tells a front end that portainer_maintenance.update_portainer
+                    # exists in this version of the integration, and works now.
+                    update_now=possible,
+                    dismiss_key=_dismiss_key("portainer_self_update", item["entity"]),
+                    detail=_portainer_self_update_detail(
+                        item["host"], item["component"], "possible" if possible else "manual"
+                    ),
+                )
+            found.append(row)
+        self.update_interval = (
+            SELF_UPDATE_FAST_INTERVAL
+            if any(r.state in ("updating", "confirming") for r in self.updates.values())
+            else TROUBLE_INTERVAL
+        )
 
         suppressed: list[dict] = []
         if self._dismissals is not None:
@@ -1381,9 +1773,15 @@ class PortainerCleanupCoordinator(DataUpdateCoordinator[list[dict]]):
     `images_count - containers_count` from core's own per-endpoint
     diagnostic sensors instead -- a rough "how many images exist beyond
     what's running" figure, good enough to seed a badge, not a precise
-    dangling count. reclaimable_mib is the real byte-accurate figure
-    (None when that sensor reads unknown/unavailable -- see
-    _numeric_state, never treat None as 0 here). images_count is core's
+    dangling count. reclaimable_mib is the real byte-accurate figure. Core
+    reports Unknown for it when nothing can be reclaimed, so Unknown is sent as
+    0 (see _size_state); None means the sensor doesn't exist or isn't a
+    number, and `reclaimable_unavailable` is true when it exists but is
+    Unavailable (the state isn't known, so the webapp offers no image prune).
+    volume_usage_mib follows the same rule. `refreshed_at` is when this
+    refresh read the sensors (the same for every endpoint in it): the webapp
+    refetches every 15 s but this only refreshes every few minutes, so it needs
+    a stamp to tell a new reading from the same one again. images_count is core's
     own total image count for the endpoint, dangling ones included, passed
     through as-is: the webapp uses images_count == 0 to disable both image
     prune actions (unused_estimate can be 0 while images still exist, e.g.
@@ -1397,6 +1795,7 @@ class PortainerCleanupCoordinator(DataUpdateCoordinator[list[dict]]):
         entity_reg = er.async_get(self.hass)
         device_reg = dr.async_get(self.hass)
         found: list[dict] = []
+        refreshed_at = dt_util.utcnow().isoformat(timespec="seconds")
 
         for endpoint_device_id in _discover_endpoint_devices(entity_reg, device_reg):
             host = _device_name(device_reg, endpoint_device_id) or "unknown host"
@@ -1406,8 +1805,12 @@ class PortainerCleanupCoordinator(DataUpdateCoordinator[list[dict]]):
             unused_estimate = max(int(images) - int(containers), 0) if images is not None and containers is not None else None
             images_count = int(images) if images is not None else None
 
-            reclaimable_mib = _numeric_state(self.hass, _endpoint_reclaimable_entity(entity_reg, endpoint_device_id))
-            volume_usage_mib = _numeric_state(self.hass, _endpoint_volume_usage_entity(entity_reg, endpoint_device_id))
+            reclaimable_mib, reclaimable_unavailable = _size_state(
+                self.hass, _endpoint_reclaimable_entity(entity_reg, endpoint_device_id)
+            )
+            volume_usage_mib, _volume_unavailable = _size_state(
+                self.hass, _endpoint_volume_usage_entity(entity_reg, endpoint_device_id)
+            )
             volumes_prune_button = _endpoint_volumes_prune_button(entity_reg, endpoint_device_id)
 
             found.append(
@@ -1417,8 +1820,10 @@ class PortainerCleanupCoordinator(DataUpdateCoordinator[list[dict]]):
                     "images_count": images_count,
                     "unused_estimate": unused_estimate,
                     "reclaimable_mib": reclaimable_mib,
+                    "reclaimable_unavailable": reclaimable_unavailable,
                     "volume_usage_mib": volume_usage_mib,
                     "volumes_prune_button": volumes_prune_button,
+                    "refreshed_at": refreshed_at,
                 }
             )
 
