@@ -243,15 +243,22 @@ update_portainer:
     replacement starts). Starts Portainer's own portainer/portainer-updater
     helper container on the same host, with the Docker socket mounted, and
     returns as soon as it has started -- it does not wait, because Portainer
-    is unavailable while it restarts. For the server the helper runs
-    "portainer --image=<ref> --health-check", for the agent
+    is unavailable while it restarts. The helper image is the
+    portainer-updater tagged with the version Portainer reports it is running
+    now (one read of the Portainer API's system/status; for the agent that is
+    the server's version, which agents are meant to match), never :latest,
+    which is a 2024 build. When that version can't be read cleanly nothing is
+    started, and the error says to update by hand (Portainer's own update
+    prompt, or pull the image and recreate the container). For the
+    server the helper runs "portainer --image=<ref>", for the agent
     "agent <schedule id> <ref>", where <ref> is the image reference the
     container currently runs; the helper pulls it, replaces the container
-    with the same configuration and removes itself when done. For the
-    server, --health-check makes the helper wait for the new Portainer to
-    report healthy and otherwise roll the Portainer database back and
-    restart the old container (the wait can be long, and Portainer is down
-    meanwhile). Refused unless an update is pending and the
+    with the same configuration and removes itself when done. For a server
+    container that has a Docker health status of its own (core shows a health
+    sensor on its device), "--health-check" is added: the helper then waits
+    for the new Portainer to report healthy and otherwise rolls the Portainer
+    database back and restarts the old container (the wait can be long, and
+    Portainer is down meanwhile). Refused unless an update is pending and the
     container's image has an explicit tag (not a bare digest, not a digest
     pin, not untagged). A second start for the same container within ten
     minutes is refused. Do other updates on that host first. Returns what it
@@ -272,7 +279,9 @@ update_portainer:
       name: Dry run
       description: >-
         Work out and return what would be run (target image, helper
-        command, endpoint and container ids) without calling Portainer.
+        command, endpoint and container ids) without starting anything.
+        Reads the Portainer version once (system/status), so it also shows
+        whether that version can be read.
       required: false
       default: false
       selector:

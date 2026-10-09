@@ -93,6 +93,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import shutil
 import time
 import uuid
@@ -213,10 +214,18 @@ CORE_PORTAINER_DOMAIN = "portainer"
 # Portainer's helper image for updating Portainer in place. Its source is
 # github.com/portainer/portainer-updater; the command lines below are the
 # ones its README documents ("portainer --image=<ref>" for the server,
-# "agent <schedule-id> <image>" for the agent). The server command also
-# passes --health-check, which exists only on the updater's "portainer"
-# command (the "agent" command has no such flag and rejects it).
-PORTAINER_UPDATER_IMAGE = "portainer/portainer-updater:latest"
+# "agent <schedule-id> <image>" for the agent).
+#
+# The helper is pulled at the same version as the Portainer container being
+# updated, never ":latest": its Docker Hub "latest" tag stopped moving in
+# August 2024, so it is a build that predates flags the current helper has
+# (--health-check was added in September 2025), and a helper that does not
+# know a flag rejects it at argument parsing and exits at once. Its versioned
+# tags are published alongside Portainer's own releases. The version comes
+# from the Portainer API's system/status (the Portainer image sets no
+# org.opencontainers.image.version label, so core has no "image version"
+# sensor for it).
+PORTAINER_UPDATER_REPO = "portainer/portainer-updater"
 PORTAINER_UPDATER_SOCKET_BIND = "/var/run/docker.sock:/var/run/docker.sock"
 PORTAINER_UPDATER_PULL_TIMEOUT = timedelta(minutes=5)
 # A second start for the same Portainer container inside this window is
@@ -292,32 +301,97 @@ def _updater_target_image(image_ref: str | None, container_name: str, host: str)
     return ref
 
 
-def _updater_command(component: str, image: str, schedule_id: str) -> list[str]:
+def _updater_command(
+    component: str, image: str, schedule_id: str, health_check: bool = False
+) -> list[str]:
     """The portainer-updater command line (its entrypoint is the updater
     binary, so this is the container's Cmd).
 
-    The server command passes --health-check: after starting the new
-    Portainer the updater runs the new image's own "/portainer
-    --health-check" until it passes, and if it never does (or the new
-    container fails to start) it also rolls the Portainer database back to
+    health_check adds --health-check to the server command. With it, after
+    starting the new Portainer the updater runs the new image's own
+    "/portainer --health-check" until it passes, and if it never does (or the
+    new container fails to start) it also rolls the Portainer database back to
     its pre-update state, then removes the new container and restarts the
-    old one. Without the flag it still restarts the old container on a
+    old one. Without it the updater still restarts the old container on a
     failed start or failed Docker health check, but does not roll the
     database back, which matters when the new version has already migrated
-    it. An image too old to know the flag is treated as healthy by the
-    updater, so the flag is safe on any image. The agent command takes no
-    such flag (the updater checks a new agent on its own), so none is
-    passed there."""
+    it. The updater retries that check for up to a few hours, so a check
+    that can never pass leaves the update hanging and ends in a rollback of
+    an update that worked: that happened with a Portainer EE image whose
+    "--health-check" crashed on a FIPS initialisation error. The flag is
+    therefore only passed for a container that has a Docker health status of
+    its own (see _container_has_health_status), and a helper that predates the
+    flag rejects it at parse time, which is why the helper is pinned to the
+    running version rather than "latest". The agent command takes no such
+    flag (the updater checks a new agent on its own), so none is passed
+    there."""
     if component == "agent":
         return ["agent", schedule_id, image]
-    return ["portainer", f"--image={image}", "--health-check"]
+    command = ["portainer", f"--image={image}"]
+    if health_check:
+        command.append("--health-check")
+    return command
 
 
-def _core_container_target(
+_PLAIN_VERSION_RE = re.compile(r"^v?(\d+\.\d+\.\d+)$")
+
+
+def _updater_image(
+    running_version: str | None,
+    container_name: str,
+    host: str,
+    target_image: str,
+) -> str:
+    """The portainer-updater image to run: the updater tagged with the version
+    Portainer reports it is running now. Refuses rather than guess when that
+    version can't be read cleanly, because the fallback (":latest") is a build
+    from 2024; the message is then the manual instruction for the user."""
+    version = (running_version or "").strip()
+    match = _PLAIN_VERSION_RE.match(version)
+    if not match:
+        raise HomeAssistantError(
+            f"Couldn't read a clean Portainer version from the Portainer API "
+            f"(it reported '{version or 'nothing'}'), so there is no matching "
+            f"portainer-updater image to use and nothing was started. Update "
+            f"{container_name} on {host} by hand: use the update prompt in "
+            f"Portainer's own web UI, or pull {target_image} on {host} and "
+            "recreate the container with its existing settings."
+        )
+    return f"{PORTAINER_UPDATER_REPO}:{match.group(1)}"
+
+
+async def _running_portainer_version(coordinator: object) -> str | None:
+    """The version of the Portainer server core talks to, from its
+    system/status endpoint (one cheap request; no GitHub lookup). The agent's
+    own version isn't reported there; agents are meant to match the server.
+    None when the request fails or reports no version."""
+    try:
+        status = await coordinator.portainer.portainer_system_status()
+    except Exception as err:  # noqa: BLE001 - any failure means "can't tell"
+        _LOGGER.warning(
+            "%s.update_portainer: couldn't read the Portainer version from "
+            "system/status: %s: %s",
+            DOMAIN, type(err).__name__, err,
+        )
+        return None
+    return getattr(status, "version", None)
+
+
+def _container_has_health_status(container_data: object) -> bool:
+    """True when Docker reports a health status for the container (it has a
+    HEALTHCHECK: core then shows a health sensor on its device and the
+    container is "healthy" rather than just "running")."""
+    inspect = getattr(container_data, "container_inspect", None)
+    state = getattr(inspect, "state", None)
+    return getattr(state, "health", None) is not None
+
+
+def _core_container_data(
     hass: HomeAssistant, device_reg: dr.DeviceRegistry, container_device_id: str
-) -> tuple[object, int, str]:
-    """(core coordinator, endpoint id, container id) for a container device,
-    resolved the way core's own portainer.recreate_container service does."""
+) -> tuple[object, int, object]:
+    """(core coordinator, endpoint id, core's data for the container) for a
+    container device, resolved the way core's own portainer.recreate_container
+    service does."""
     device = device_reg.async_get(container_device_id)
     if device is not None:
         for core_entry in hass.config_entries.async_entries(CORE_PORTAINER_DOMAIN):
@@ -331,11 +405,21 @@ def _core_container_target(
                         f"{core_entry.entry_id}_{data.endpoint.id}_{container_name}",
                     )
                     if identifier in device.identifiers:
-                        return coordinator, data.endpoint.id, container_data.container.id
+                        return coordinator, data.endpoint.id, container_data
     raise HomeAssistantError(
         "Couldn't match this container to one of core Portainer's current containers "
         "(is the Portainer integration loaded, and is the host reachable?)."
     )
+
+
+def _core_container_target(
+    hass: HomeAssistant, device_reg: dr.DeviceRegistry, container_device_id: str
+) -> tuple[object, int, str]:
+    """(core coordinator, endpoint id, container id) for a container device."""
+    coordinator, endpoint_id, container_data = _core_container_data(
+        hass, device_reg, container_device_id
+    )
+    return coordinator, endpoint_id, container_data.container.id
 
 
 async def _refresh_after_action(
@@ -971,12 +1055,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         target_image = _updater_target_image(
             image_state.state if image_state else None, container_name, host_name
         )
-        coordinator, endpoint_id, container_id = _core_container_target(
+        coordinator, endpoint_id, container_data = _core_container_data(
             hass, device_reg, container_device_id
         )
+        container_id = container_data.container.id
+        updater_image = _updater_image(
+            await _running_portainer_version(coordinator),
+            container_name,
+            host_name,
+            target_image,
+        )
+        health_check = _container_has_health_status(container_data)
 
         schedule_id = str(int(time.time()))
-        command = _updater_command(component, target_image, schedule_id)
+        command = _updater_command(component, target_image, schedule_id, health_check)
         updater_name = f"portainer-maintenance-updater-{uuid.uuid4().hex[:8]}"
         plan = {
             "component": component,
@@ -985,9 +1077,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             "endpoint_id": endpoint_id,
             "container_id": container_id,
             "target_image": target_image,
-            "updater_image": PORTAINER_UPDATER_IMAGE,
+            "updater_image": updater_image,
             "updater_name": updater_name,
             "command": command,
+            "health_check": health_check,
             "update_pending": update_pending,
         }
         if dry_run:
@@ -1007,18 +1100,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
         portainer = coordinator.portainer
         updater_container_id: str | None = None
-        step = "pulling the updater image"
+        step = f"pulling the updater image {updater_image}"
         try:
             await portainer.image_recreate(
                 endpoint_id=endpoint_id,
-                image_id=PORTAINER_UPDATER_IMAGE,
+                image_id=updater_image,
                 timeout=PORTAINER_UPDATER_PULL_TIMEOUT,
             )
             step = "creating the updater container"
             created = await portainer.container_create(
                 endpoint_id=endpoint_id,
                 name=updater_name,
-                image=PORTAINER_UPDATER_IMAGE,
+                image=updater_image,
                 config={
                     "Cmd": command,
                     "HostConfig": {
@@ -1054,9 +1147,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             ) from err
 
         _LOGGER.warning(
-            "%s.update_portainer: started %s (%s) on %s to update '%s' to %s. "
-            "Portainer will be unavailable while it restarts.",
-            DOMAIN, updater_name, updater_container_id, host_name, container_name, target_image,
+            "%s.update_portainer: started %s (%s, image %s, command %s) on %s to update "
+            "'%s' to %s. Portainer will be unavailable while it restarts.",
+            DOMAIN, updater_name, updater_container_id, updater_image, " ".join(command),
+            host_name, container_name, target_image,
         )
         return {
             **plan,
