@@ -1320,18 +1320,48 @@ class PortainerStaleCoordinator(DataUpdateCoordinator[list[dict]]):
         if wait_for is not None:
             self._schedule_scan(wait_for + 1)
 
+        def stack_run_state(stack_device_id: str) -> str | None:
+            """'running' or 'stopped' for a live stack, from its stack switch
+            (on = Portainer status Active, off = Inactive); None when the
+            switch is missing or has no usable state."""
+            for entity_id in entities_by_device.get(stack_device_id, ()):
+                if not entity_id.startswith("switch."):
+                    continue
+                state = self.hass.states.get(entity_id)
+                if state is not None and state.state in ("on", "off"):
+                    return "running" if state.state == "on" else "stopped"
+            return None
+
+        def describe(device_id: str) -> str:
+            """What the Stale tab says under a device's name. The type comes
+            from the device's own `model` (core sets Endpoint, Stack,
+            Container or Volume); the host is left out because the item's
+            name already ends with it."""
+            device = device_reg.async_get(device_id)
+            model = (getattr(device, "model", None) or "").strip()
+            if model == "Container":
+                parent_id = device.via_device_id
+                parent = device_reg.async_get(parent_id) if parent_id else None
+                if parent is not None and getattr(parent, "model", None) == "Stack":
+                    stack_name = parent.name_by_user or parent.name
+                    # A stack that is itself on this list is "stale"; one that
+                    # is not still exists, so say whether it is running or
+                    # stopped (or neither, if its switch can't be read).
+                    kind = "stale" if parent_id in stale else stack_run_state(parent_id)
+                    prefix = f"{kind} " if kind else ""
+                    return f"Container in {prefix}stack {stack_name} no longer exists in Portainer"
+                # Standalone, or its parent can't be told apart from the endpoint.
+                return "Container no longer exists in Portainer"
+            return f"{model or 'Device'} no longer exists in Portainer"
+
         found: list[dict] = []
-        for device_id, (root_id, is_root) in stale.items():
+        for device_id, (root_id, _is_root) in stale.items():
             host_name = _device_name(device_reg, root_id) or "unknown host"
             name = _device_name(device_reg, device_id) or device_id
             found.append(
                 {
                     "name": f"{name} ({host_name})",
-                    "secondary_info": (
-                        "Stale — no longer in Portainer"
-                        if is_root
-                        else "Stale — its stack is no longer in Portainer"
-                    ),
+                    "secondary_info": describe(device_id),
                     "device_id": device_id,
                     "host": host_name,
                     "host_device_id": root_id,
