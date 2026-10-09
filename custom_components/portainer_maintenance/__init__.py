@@ -134,7 +134,8 @@ from .sensor import (
     _looks_like_bare_digest,
     _portainer_component,
     _portainer_entity_ids,
-    _portainer_self_update_detail,
+    _PORTAINER_MANUAL_STEPS,
+    _portainer_subject,
     _stack_info,
     _walk_to_root,
 )
@@ -228,7 +229,7 @@ CORE_PORTAINER_DOMAIN = "portainer"
 PORTAINER_UPDATER_REPO = "portainer/portainer-updater"
 PORTAINER_UPDATER_SOCKET_BIND = "/var/run/docker.sock:/var/run/docker.sock"
 PORTAINER_UPDATER_PULL_TIMEOUT = timedelta(minutes=5)
-# A second start for the same Portainer container inside this window is
+# A second start for the same Portainer update entity inside this window is
 # refused, so a double click or a retried call can't run two helpers against
 # the same container at once. In memory only, and it hides nothing: the
 # update stays listed for as long as core's update entity says it is on.
@@ -933,7 +934,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         portainer_component = _portainer_component(hass, entity_reg, container_device_id)
         if portainer_component is not None:
             raise HomeAssistantError(
-                _portainer_self_update_detail(container_name, host_name, portainer_component)
+                f"{_portainer_subject(host_name, portainer_component)} can't be updated with "
+                f"{DOMAIN}.{SERVICE_PERFORM_UPDATE}: recreating it from inside Portainer stops "
+                f"the process doing the recreate and leaves it stopped. Use "
+                f"{DOMAIN}.{SERVICE_UPDATE_PORTAINER} instead. {_PORTAINER_MANUAL_STEPS}"
             )
 
         switch_entity_id = _stack_switch_entity_id(hass, container_device_id)
@@ -1086,9 +1090,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if dry_run:
             return {**plan, "dry_run": True, "started": False}
 
+        # Keyed on the update entity: the container id changes when the update
+        # works, the entity does not.
         started = hass.data[DOMAIN][entry.entry_id].setdefault("updater_started", {})
+        trouble = hass.data[DOMAIN][entry.entry_id].get("coordinators", {}).get("trouble")
         now = time.monotonic()
-        last = started.get(container_id)
+        last = started.get(update_entity)
+        if trouble is not None and trouble.is_update_tracked(update_entity):
+            raise HomeAssistantError(
+                f"An update of {container_name} on {host_name} is already being followed "
+                "(see the Updates row on the Needs Remediation tab)."
+            )
         if last is not None and now - last < PORTAINER_UPDATER_REPEAT_GUARD_SECONDS:
             raise HomeAssistantError(
                 f"An update of {container_name} on {host_name} was started "
@@ -1096,7 +1108,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 "and check the host before starting another."
             )
         # Claimed before the first await so two overlapping calls can't both start.
-        started[container_id] = now
+        started[update_entity] = now
 
         portainer = coordinator.portainer
         updater_container_id: str | None = None
@@ -1126,7 +1138,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 endpoint_id=endpoint_id, container_id=updater_container_id
             )
         except Exception as err:
-            started.pop(container_id, None)
+            started.pop(update_entity, None)
             _LOGGER.error(
                 "%s.update_portainer: failed while %s for '%s' on %s: %s",
                 DOMAIN, step, container_name, host_name, err,
@@ -1152,6 +1164,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             DOMAIN, updater_name, updater_container_id, updater_image, " ".join(command),
             host_name, container_name, target_image,
         )
+        if trouble is not None:
+            trouble.start_update_tracking(
+                entity=update_entity,
+                device_id=container_device_id,
+                component=component,
+                container_id=container_id,
+                helper_id=updater_container_id,
+                helper_name=updater_name,
+                health_check=health_check,
+                core_coordinator=coordinator,
+            )
+            await trouble.async_request_refresh()
         return {
             **plan,
             "dry_run": False,
