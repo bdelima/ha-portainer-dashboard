@@ -222,8 +222,9 @@ CORE_PORTAINER_DOMAIN = "portainer"
 # (--health-check was added in September 2025), and a helper that does not
 # know a flag rejects it at argument parsing and exits at once. Its versioned
 # tags are published alongside Portainer's own releases. The version comes
-# from the container's own org.opencontainers.image.version label (core's
-# "image version" sensor on the container device).
+# from the Portainer API's system/status (the Portainer image sets no
+# org.opencontainers.image.version label, so core has no "image version"
+# sensor for it).
 PORTAINER_UPDATER_REPO = "portainer/portainer-updater"
 PORTAINER_UPDATER_SOCKET_BIND = "/var/run/docker.sock:/var/run/docker.sock"
 PORTAINER_UPDATER_PULL_TIMEOUT = timedelta(minutes=5)
@@ -332,35 +333,48 @@ def _updater_command(
     return command
 
 
-_VERSION_LABEL = "org.opencontainers.image.version"
 _PLAIN_VERSION_RE = re.compile(r"^v?(\d+\.\d+\.\d+)$")
 
 
-def _updater_image(running_version: str | None, container_name: str, host: str) -> str:
+def _updater_image(
+    running_version: str | None,
+    container_name: str,
+    host: str,
+    target_image: str,
+) -> str:
     """The portainer-updater image to run: the updater tagged with the version
-    the Portainer container being updated is running now. Refuses rather than
-    guess when that version can't be read, because the fallback (":latest")
-    is a build from 2024."""
+    Portainer reports it is running now. Refuses rather than guess when that
+    version can't be read cleanly, because the fallback (":latest") is a build
+    from 2024; the message is then the manual instruction for the user."""
     version = (running_version or "").strip()
     match = _PLAIN_VERSION_RE.match(version)
     if not match:
         raise HomeAssistantError(
-            f"Can't tell which version {container_name} on {host} is running "
-            f"({_VERSION_LABEL} label: '{version or 'missing'}'), so there is no "
-            "matching portainer-updater image to use. Its image version sensor "
-            "should show a plain version such as 2.45.2. Update it manually "
-            "instead."
+            f"Couldn't read a clean Portainer version from the Portainer API "
+            f"(it reported '{version or 'nothing'}'), so there is no matching "
+            f"portainer-updater image to use and nothing was started. Update "
+            f"{container_name} on {host} by hand: use the update prompt in "
+            f"Portainer's own web UI, or pull {target_image} on {host} and "
+            "recreate the container with its existing settings."
         )
     return f"{PORTAINER_UPDATER_REPO}:{match.group(1)}"
 
 
-def _container_running_version(container_data: object) -> str | None:
-    """The org.opencontainers.image.version label of a core Portainer
-    container (the same value core shows as the container's "image version"
-    sensor), or None when it has none."""
-    container = getattr(container_data, "container", None)
-    labels = getattr(container, "labels", None)
-    return labels.get(_VERSION_LABEL) if labels else None
+async def _running_portainer_version(coordinator: object) -> str | None:
+    """The version of the Portainer server core talks to, from its
+    system/status endpoint (one cheap request; no GitHub lookup). The agent's
+    own version isn't reported there; agents are meant to match the server.
+    None when the request fails or reports no version."""
+    try:
+        status = await coordinator.portainer.portainer_system_status()
+    except Exception as err:  # noqa: BLE001 - any failure means "can't tell"
+        _LOGGER.warning(
+            "%s.update_portainer: couldn't read the Portainer version from "
+            "system/status: %s: %s",
+            DOMAIN, type(err).__name__, err,
+        )
+        return None
+    return getattr(status, "version", None)
 
 
 def _container_has_health_status(container_data: object) -> bool:
@@ -1046,7 +1060,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         )
         container_id = container_data.container.id
         updater_image = _updater_image(
-            _container_running_version(container_data), container_name, host_name
+            await _running_portainer_version(coordinator),
+            container_name,
+            host_name,
+            target_image,
         )
         health_check = _container_has_health_status(container_data)
 
