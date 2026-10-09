@@ -1353,7 +1353,12 @@ class PortainerCleanupCoordinator(DataUpdateCoordinator[list[dict]]):
     what's running" figure, good enough to seed a badge, not a precise
     dangling count. reclaimable_mib is the real byte-accurate figure
     (None when that sensor reads unknown/unavailable -- see
-    _numeric_state, never treat None as 0 here)."""
+    _numeric_state, never treat None as 0 here). images_count is core's
+    own total image count for the endpoint, dangling ones included, passed
+    through as-is: the webapp uses images_count == 0 to disable both image
+    prune actions (unused_estimate can be 0 while images still exist, e.g.
+    when several containers share an image, so it can't tell "no images"
+    from "nothing beyond what's running"). None when unknown."""
 
     def __init__(self, hass: HomeAssistant) -> None:
         super().__init__(hass, _LOGGER, name=SENSOR_CLEANUP, update_interval=timedelta(minutes=5))
@@ -1369,6 +1374,7 @@ class PortainerCleanupCoordinator(DataUpdateCoordinator[list[dict]]):
             images = _numeric_state(self.hass, _endpoint_images_count_entity(entity_reg, endpoint_device_id))
             containers = _numeric_state(self.hass, _endpoint_containers_count_entity(entity_reg, endpoint_device_id))
             unused_estimate = max(int(images) - int(containers), 0) if images is not None and containers is not None else None
+            images_count = int(images) if images is not None else None
 
             reclaimable_mib = _numeric_state(self.hass, _endpoint_reclaimable_entity(entity_reg, endpoint_device_id))
             volume_usage_mib = _numeric_state(self.hass, _endpoint_volume_usage_entity(entity_reg, endpoint_device_id))
@@ -1378,6 +1384,7 @@ class PortainerCleanupCoordinator(DataUpdateCoordinator[list[dict]]):
                 {
                     "host": host,
                     "device_id": endpoint_device_id,
+                    "images_count": images_count,
                     "unused_estimate": unused_estimate,
                     "reclaimable_mib": reclaimable_mib,
                     "volume_usage_mib": volume_usage_mib,
