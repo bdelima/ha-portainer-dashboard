@@ -63,6 +63,14 @@ _LOGGER = logging.getLogger(__name__)
 # after startup. Used by the Trouble items and by Stale Devices.
 SETTLE_SECONDS = 120
 
+# Updates: how long after a core Portainer update entity changes state the
+# list is re-read (a burst of changes shares one timer), and the longest an
+# update that has gone "on" -> "unknown" (core's sign that the container is
+# being recreated) is kept listed, as "confirming", while waiting for core to
+# settle on "off" (installed) or "on" (the install did not take).
+UPDATES_DEBOUNCE_SECONDS = 5
+UPDATES_CONFIRM_MAX_SECONDS = 420
+
 # Cleanup: how long after a change to one of a host's source sensors the
 # Cleanup numbers are re-read (a burst of changes shares one timer, so the
 # three sensors core updates together are read together), and how often they
@@ -992,11 +1000,117 @@ async def _fetch_oci_source_label(hass: HomeAssistant, host: str | None, repo: s
 # ---------------------------------------------------------------------------
 
 class PortainerUpdatesCoordinator(DataUpdateCoordinator[list[dict]]):
-    """Ports the original 5-minute update_items template."""
+    """Ports the original 5-minute update_items template.
+
+    The 5-minute poll is the backstop. Once `async_start` has run it also
+    re-reads shortly after a core Portainer `update.*` entity changes state,
+    so an install (from the webapp, or from Portainer's own UI) shows up in
+    the list within seconds rather than at the next poll.
+
+    After a recreate core's update entity goes "on" -> "unknown" while the
+    container restarts, and only then to "off" (up to date) -- or back to
+    "on" if the install did not take. That "unknown" is the expected sign
+    that the install is still being processed, so an update that went
+    "on" -> "unknown" stays listed, flagged `confirming: true`, until core
+    reaches either state (or UPDATES_CONFIRM_MAX_SECONDS passes). An entity
+    that is "unknown" without having been "on" first is not listed.
+    """
 
     def __init__(self, hass: HomeAssistant) -> None:
         super().__init__(hass, _LOGGER, name=SENSOR_UPDATES_PENDING, update_interval=timedelta(minutes=5))
         self._changelog_cache: dict[str, str | None] = {}
+        self._unsubs: list[CALLBACK_TYPE] = []
+        self._timer: CALLBACK_TYPE | None = None
+        self._timer_due: float = 0.0
+        self._expiry_timer: CALLBACK_TYPE | None = None
+        # entity_id -> loop time at which it went "on" -> "unknown"
+        self._confirming: dict[str, float] = {}
+
+    # -- follow core's update entities -------------------------------------
+
+    @callback
+    def async_start(self) -> None:
+        """Start re-reading on changes. Call once, after the first refresh."""
+        self._unsubs = [
+            self.hass.bus.async_listen(
+                EVENT_STATE_CHANGED,
+                self._handle_update_change,
+                event_filter=self._is_update_change,
+            ),
+        ]
+
+    @callback
+    def async_stop(self) -> None:
+        for unsub in self._unsubs:
+            unsub()
+        self._unsubs = []
+        for timer in (self._timer, self._expiry_timer):
+            if timer is not None:
+                timer()
+        self._timer = None
+        self._expiry_timer = None
+        self._confirming.clear()
+
+    @callback
+    def _is_update_change(self, event_or_data: Any) -> bool:
+        """Cheap pre-filter: a real change of state of a core Portainer
+        update entity. Takes the event or its data, whichever this Home
+        Assistant version passes to an event filter."""
+        data: Mapping[str, Any] = getattr(event_or_data, "data", event_or_data)
+        entity_id = data.get("entity_id")
+        if not isinstance(entity_id, str) or not entity_id.startswith("update."):
+            return False
+        old, new = data.get("old_state"), data.get("new_state")
+        if (old.state if old is not None else None) == (new.state if new is not None else None):
+            return False
+        entry = er.async_get(self.hass).async_get(entity_id)
+        return entry is not None and entry.platform == "portainer"
+
+    @callback
+    def _handle_update_change(self, event: Any) -> None:
+        data: Mapping[str, Any] = getattr(event, "data", event)
+        entity_id = data["entity_id"]
+        old, new = data.get("old_state"), data.get("new_state")
+        if old is not None and new is not None and old.state == "on" and new.state == "unknown":
+            self._confirming[entity_id] = self.hass.loop.time()
+            self._arm_expiry()
+        elif new is None or new.state != "unknown":
+            # "off" (installed), "on" (did not take), unavailable, removed:
+            # core has settled, so the keep-alive is over.
+            self._confirming.pop(entity_id, None)
+        self._schedule_scan(UPDATES_DEBOUNCE_SECONDS)
+
+    @callback
+    def _schedule_scan(self, delay: float) -> None:
+        due = self.hass.loop.time() + delay
+        if self._timer is not None:
+            if self._timer_due <= due:
+                return
+            self._timer()
+        self._timer_due = due
+        self._timer = async_call_later(self.hass, delay, self._timer_fired)
+
+    @callback
+    def _timer_fired(self, _now: datetime) -> None:
+        self._timer = None
+        self.hass.async_create_task(self.async_refresh())
+
+    @callback
+    def _arm_expiry(self) -> None:
+        """Re-read once the oldest confirming entry has used up its time."""
+        if self._expiry_timer is not None:
+            self._expiry_timer()
+            self._expiry_timer = None
+        if not self._confirming:
+            return
+        due = min(self._confirming.values()) + UPDATES_CONFIRM_MAX_SECONDS
+        delay = max(0.0, due - self.hass.loop.time()) + 1
+        self._expiry_timer = async_call_later(self.hass, delay, self._expiry_fired)
+
+    @callback
+    def _expiry_fired(self, _now: datetime) -> None:
+        self._expiry_timer = None
+        self.hass.async_create_task(self.async_refresh())
 
     async def _resolve_changelog_url(
         self, entity_reg: er.EntityRegistry, container_device_id: str | None
@@ -1076,18 +1190,29 @@ class PortainerUpdatesCoordinator(DataUpdateCoordinator[list[dict]]):
         # _stacks_with_open_trouble's docstring. Cheap (registry/state
         # reads only), so no reason to cache it further.
         stuck_stacks = _stacks_with_open_trouble(self.hass, entity_reg, device_reg)
+        now_loop = self.hass.loop.time()
 
         for entity_id in _portainer_entity_ids(entity_reg):
             if not entity_id.startswith("update."):
                 continue
             state = self.hass.states.get(entity_id)
-            # An update is listed exactly while the core Portainer update
-            # entity says "on". There is deliberately no local "recently
-            # installed" hold: on HA 2026.10+ core re-checks a recreated
-            # container's image straight away, so the entity goes "off" by
-            # itself once the install has really worked, and stays "on" if
-            # it has not -- which is the honest answer.
-            if state is None or state.state != "on":
+            # An update is listed while the core Portainer update entity says
+            # "on", and -- flagged `confirming` -- while it is "unknown"
+            # having been "on": core's own sequence after a recreate is
+            # "on" -> "unknown" (container restarting) -> "off" (installed)
+            # or back to "on" (it did not take). There is deliberately no
+            # other local "recently installed" hold: once core settles, the
+            # entity itself is the honest answer.
+            confirming = False
+            if state is not None and state.state == "on":
+                self._confirming.pop(entity_id, None)
+            elif state is not None and state.state == "unknown" and entity_id in self._confirming:
+                if now_loop - self._confirming[entity_id] >= UPDATES_CONFIRM_MAX_SECONDS:
+                    self._confirming.pop(entity_id, None)
+                    continue
+                confirming = True
+            else:
+                self._confirming.pop(entity_id, None)
                 continue
 
             reg_entry = entity_reg.async_get(entity_id)
@@ -1106,27 +1231,33 @@ class PortainerUpdatesCoordinator(DataUpdateCoordinator[list[dict]]):
             stack_dev_id = _stack_device_id(device_reg, device_id)
             changelog_url = await self._resolve_changelog_url(entity_reg, device_id)
 
-            found.append(
-                {
-                    "entity": entity_id,
-                    "name": f"{container_name} ({host})",
-                    "secondary_info": "Update available",
-                    "host": host,
-                    "host_device_id": root_id,
-                    "stack_name": stack_name,
-                    "stack_device_id": stack_dev_id,
-                    "stack_switch_entity_id": stack_switch_entity_id,
-                    "changelog_url": changelog_url,
-                    # (1.3.2) See _github_repo_slug above.
-                    "changelog_repo": _github_repo_slug(changelog_url),
-                    # (1.3.0) True when this container's stack has an open
-                    # "needs a restart" Trouble item -- the webapp badges
-                    # the stack's row with this so a fresh install doesn't
-                    # get triggered blind while a restart is still owed.
-                    "stack_has_open_trouble": bool(stack_dev_id and stack_dev_id in stuck_stacks),
-                }
-            )
+            item = {
+                "entity": entity_id,
+                "name": f"{container_name} ({host})",
+                "secondary_info": "Update available",
+                "host": host,
+                "host_device_id": root_id,
+                "stack_name": stack_name,
+                "stack_device_id": stack_dev_id,
+                "stack_switch_entity_id": stack_switch_entity_id,
+                "changelog_url": changelog_url,
+                # (1.3.2) See _github_repo_slug above.
+                "changelog_repo": _github_repo_slug(changelog_url),
+                # (1.3.0) True when this container's stack has an open
+                # "needs a restart" Trouble item -- the webapp badges
+                # the stack's row with this so a fresh install doesn't
+                # get triggered blind while a restart is still owed.
+                "stack_has_open_trouble": bool(stack_dev_id and stack_dev_id in stuck_stacks),
+            }
+            if confirming:
+                # Present only while true (older webapps ignore it): core's
+                # update entity is "unknown", i.e. the container is being
+                # recreated and core has not yet said whether it took.
+                item["secondary_info"] = "Confirming update…"
+                item["confirming"] = True
+            found.append(item)
 
+        self._arm_expiry()
         return found
 
 
@@ -2122,6 +2253,12 @@ async def async_setup_entry(
     # or from unavailable, or a device/entity registry entry changes.
     stale_coordinator.async_start()
     entry.async_on_unload(stale_coordinator.async_stop)
+
+    # The updates list keeps its 5-minute poll as a backstop, but also
+    # re-reads when a core Portainer update entity changes state (see the
+    # coordinator).
+    updates_coordinator.async_start()
+    entry.async_on_unload(updates_coordinator.async_stop)
 
     # Cleanup isn't polled either: it re-reads when one of a host's source
     # sensors changes, with a backstop every few minutes (see the coordinator).
