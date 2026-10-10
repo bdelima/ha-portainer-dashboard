@@ -118,6 +118,8 @@ from .const import (
     CONF_WEBAPP_URL,
     DEFAULT_ADMIN_ONLY,
     DOMAIN,
+    EVENT_STACK_RESTART_NEEDED,
+    EVENT_UPDATE_DONE,
     PANEL_ICON,
     PANEL_PATH,
     PANEL_TITLE,
@@ -160,8 +162,6 @@ RECREATE_WAIT_POLL_SECONDS = 5
 # call, not compensating for an async one.
 PRUNE_REFRESH_PRE_DELAY_SECONDS = 3
 PRUNE_REFRESH_POST_DELAY_SECONDS = 1
-
-DISMISS_ACTION = {"action": "dismiss", "title": "Dismiss"}
 
 SERVICE_REMOVE_DEVICE = "remove_device"
 SERVICE_REMOVE_DEVICE_SCHEMA = vol.Schema({vol.Required("device_id"): cv.string})
@@ -554,43 +554,23 @@ async def _await_recreate_outcome(
 async def _async_update_done(
     hass: HomeAssistant, entry: ConfigEntry, device_name: str, update_entity: str
 ) -> None:
-    """Shared finishing logic for a completed update: a persistent_notification
-    plus a real phone push to every configured notify device."""
-    notif_id = f"portainer_update_{update_entity.replace('.', '_')}"
-    now_str = dt_util.now().strftime("%Y-%m-%d %H:%M")
-
-    await hass.services.async_call(
-        "persistent_notification", "dismiss", {"notification_id": notif_id}
-    )
-    await hass.services.async_call(
-        "persistent_notification",
-        "create",
+    """Shared finishing logic for a completed update: fire
+    EVENT_UPDATE_DONE. The bundled blueprint turns it into the phone push and
+    the notification-panel entry, so both follow the Updates category's
+    channel and toggles (they used to be sent from here, on the phone's
+    default channel and with no toggles). Without the automation installed
+    nothing is sent."""
+    slug = update_entity.replace(".", "_")
+    hass.bus.async_fire(
+        EVENT_UPDATE_DONE,
         {
-            "notification_id": notif_id,
-            "title": f"Update performed: {device_name}",
-            "message": f"Updated on {now_str}",
+            "device_name": device_name,
+            "update_entity": update_entity,
+            "finished_at": dt_util.now().strftime("%Y-%m-%d %H:%M"),
+            "notification_id": f"portainer_update_{slug}",
+            "tag": f"portainer_update_done_{slug}",
         },
     )
-
-    for service in _notify_services_for_entry(hass, entry):
-        domain, service_name = service.split(".", 1)
-        await hass.services.async_call(
-            domain,
-            service_name,
-            {
-                "title": "Update performed",
-                "message": f"{device_name} updated on {now_str}.",
-                "data": {
-                    "tag": f"portainer_update_done_{update_entity.replace('.', '_')}",
-                    # (1.3.0) every notification this integration sends now
-                    # carries an explicit no-op Dismiss action -- tapping
-                    # any action clears a notification from the tray, this
-                    # just gives an explicit "I saw this, nothing to do"
-                    # option alongside whatever real action(s) exist.
-                    "actions": [DISMISS_ACTION],
-                },
-            },
-        )
 
 
 async def _async_notify_stack_restart_needed(
@@ -606,13 +586,17 @@ async def _async_notify_stack_restart_needed(
     container's image tag won't fully reconcile until its stack is
     restarted.
 
-    (1.3.0) This is now purely informational: no inline "Restart Stack
-    Now" action. The actual remediation lives on the dashboard's Trouble
-    tab (a stack can have several independent per-container update
-    notifications in flight at once, and a one-tap restart baked into any
-    one of them made that workflow feel disconnected from the others) --
-    tapping this notification's action opens the dashboard directly on
-    that tab via a `#trouble` URL fragment.
+    (1.3.0) This is purely informational: no inline "Restart Stack Now"
+    action. The actual remediation lives on the dashboard's Needs
+    Remediation tab (a stack can have several independent per-container
+    update notifications in flight at once, and a one-tap restart baked
+    into any one of them made that workflow feel disconnected from the
+    others).
+
+    Fires EVENT_STACK_RESTART_NEEDED; the bundled blueprint builds the push
+    (whose action opens that tab) and the notification-panel entry under the
+    Trouble category's channel and toggles. `actions_url` is kept for the
+    callers' sake; the blueprint reads the URL from sensor.portainer_actions_url.
     """
     if switch_entity_id is None:
         _LOGGER.warning(
@@ -625,46 +609,25 @@ async def _async_notify_stack_restart_needed(
         await _async_update_done(hass, entry, device_name, update_entity)
         return
 
-    notif_id = f"portainer_update_{update_entity.replace('.', '_')}"
+    slug = update_entity.replace(".", "_")
     now_str = dt_util.now().strftime("%Y-%m-%d %H:%M")
     message = (
         f"{device_name} was updated on {now_str}, but its stack needs a restart "
         f"to finish cleanly (known Portainer limitation for containers sharing "
-        f"another container's network). Restart it from the dashboard's Trouble "
-        f"tab whenever convenient."
+        f"another container's network). Restart it from the dashboard's Needs "
+        f"Remediation tab whenever convenient."
     )
-
-    await hass.services.async_call(
-        "persistent_notification", "dismiss", {"notification_id": notif_id}
-    )
-    await hass.services.async_call(
-        "persistent_notification",
-        "create",
+    hass.bus.async_fire(
+        EVENT_STACK_RESTART_NEEDED,
         {
-            "notification_id": notif_id,
-            "title": f"Stack restart needed: {device_name}",
+            "device_name": device_name,
+            "update_entity": update_entity,
+            "finished_at": now_str,
             "message": message,
+            "notification_id": f"portainer_update_{slug}",
+            "tag": f"portainer_update_done_{slug}",
         },
     )
-
-    trouble_url = f"{actions_url}#trouble"
-    for service in _notify_services_for_entry(hass, entry):
-        domain, service_name = service.split(".", 1)
-        await hass.services.async_call(
-            domain,
-            service_name,
-            {
-                "title": "Stack restart needed",
-                "message": message,
-                "data": {
-                    "tag": f"portainer_update_done_{update_entity.replace('.', '_')}",
-                    "actions": [
-                        {"action": "URI", "title": "Open Trouble Tab", "uri": trouble_url},
-                        DISMISS_ACTION,
-                    ],
-                },
-            },
-        )
 
 
 def _install_blueprints(hass: HomeAssistant) -> None:
@@ -703,10 +666,36 @@ def _register_panel(hass: HomeAssistant, webapp_url: str, require_admin: bool = 
         frontend.async_register_built_in_panel(hass, **kwargs)
 
 
+# Unique ids of sensors this integration once provided and no longer does. Each
+# is {entry_id}_{object_id}; the registry entry outlives the sensor, so Home
+# Assistant keeps listing it as "no longer being provided by the
+# portainer_maintenance integration" until it is deleted by hand.
+LEGACY_SENSOR_OBJECT_IDS = (
+    # (1.3.0, breaking rename) became SENSOR_TROUBLE.
+    "portainer_container_trouble",
+)
+
+
+def _async_remove_legacy_entities(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Delete the registry entries of sensors this integration used to provide
+    (see LEGACY_SENSOR_OBJECT_IDS). Matched on the exact platform and unique
+    id, so only this config entry's own leftover is touched; nothing that is
+    currently provided can match, since no live sensor uses those ids."""
+    entity_reg = er.async_get(hass)
+    for object_id in LEGACY_SENSOR_OBJECT_IDS:
+        entity_id = entity_reg.async_get_entity_id("sensor", DOMAIN, f"{entry.entry_id}_{object_id}")
+        if entity_id is None:
+            continue
+        entity_reg.async_remove(entity_id)
+        _LOGGER.info("Removed the leftover entity %s (this integration no longer provides it)", entity_id)
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Portainer Maintenance from a config entry."""
     hass.data.setdefault(DOMAIN, {})
     hass.data[DOMAIN][entry.entry_id] = {}
+
+    _async_remove_legacy_entities(hass, entry)
 
     # A dismissal outlives restarts, but is only cleared by a Home Assistant
     # start (not by reloading this integration at runtime) once it is old
