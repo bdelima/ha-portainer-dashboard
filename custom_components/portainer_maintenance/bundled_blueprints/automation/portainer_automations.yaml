@@ -13,6 +13,24 @@ blueprint:
     integration -- this file is regenerated on every integration load, so
     don't hand-edit this deployed copy.
 
+    Every notification belongs to one of four categories -- Updates,
+    Trouble, Stale Devices, Cleanup -- and each category has its own
+    Android notification channel, Bypass Do Not Disturb toggle, and two
+    on/off toggles: Mobile Notification (the phone push) and Persistent
+    Notification (Home Assistant's own notification panel, the bell in the
+    sidebar). Both are on by default. "Update performed" belongs to
+    Updates and "Stack restart needed" to Trouble; the integration only
+    fires an event for those two and this automation builds the push and
+    the bell entry, so they follow their category's channel and toggles
+    too (without this automation they are not sent).
+
+    Each category also has its own look, so it reads at a glance: an emoji
+    at the start of the title (Updates ℹ️, Stale Devices and Cleanup ⚠️,
+    Trouble ❗) and, on the phone push, a matching Android status-bar icon
+    and color (the colors are the sidecar's tab-badge colors: blue, orange,
+    red). The status-bar icon and color are Android-only, like the
+    channels.
+
     Update-available detection triggers off sensor.portainer_updates_pending
     rather than listening to state_changed system-wide: that sensor's own
     coordinator already scans the entity registry for every update.*
@@ -89,6 +107,27 @@ blueprint:
       selector:
         boolean: {}
 
+    updates_mobile:
+      name: Updates -- Mobile Notification
+      description: >-
+        Send update-available pushes (including the startup recheck, the daily reminder, and 'Update performed') as a push to the device(s) above. On by default. Turn
+        off to stop them reaching your phone at all; the channel and Bypass
+        Do Not Disturb settings for this category only apply while this is
+        on. Also covers the daily reminder.
+      default: true
+      selector:
+        boolean: {}
+    updates_persistent:
+      name: Updates -- Persistent Notification
+      description: >-
+        Also show update-available pushes (including the startup recheck, the daily reminder, and 'Update performed') in Home Assistant's notification panel (the bell in
+        the sidebar), through the one "Portainer Maintenance" summary entry.
+        On by default. Turn off to leave this category out of that summary
+        and its total. Also controls the per-container 'Update performed' entry.
+      default: true
+      selector:
+        boolean: {}
+
     trouble_channel:
       name: Trouble Notification Channel
       description: >-
@@ -120,6 +159,27 @@ blueprint:
       selector:
         boolean: {}
 
+    trouble_mobile:
+      name: Trouble -- Mobile Notification
+      description: >-
+        Send trouble pushes (including 'Stack restart needed') as a push to the device(s) above. On by default. Turn
+        off to stop them reaching your phone at all; the channel and Bypass
+        Do Not Disturb settings for this category only apply while this is
+        on.
+      default: true
+      selector:
+        boolean: {}
+    trouble_persistent:
+      name: Trouble -- Persistent Notification
+      description: >-
+        Also show trouble pushes (including 'Stack restart needed') in Home Assistant's notification panel (the bell in
+        the sidebar), through the one "Portainer Maintenance" summary entry.
+        On by default. Turn off to leave this category out of that summary
+        and its total. Also controls the per-container 'Stack restart needed' entry.
+      default: true
+      selector:
+        boolean: {}
+
     stale_channel:
       name: Stale Devices Notification Channel
       description: >-
@@ -140,6 +200,27 @@ blueprint:
         channel instead of the channel above. Shared phone-wide, not
         exclusive to Portainer. Off by default.
       default: false
+      selector:
+        boolean: {}
+
+    stale_mobile:
+      name: Stale Devices -- Mobile Notification
+      description: >-
+        Send stale-device pushes as a push to the device(s) above. On by default. Turn
+        off to stop them reaching your phone at all; the channel and Bypass
+        Do Not Disturb settings for this category only apply while this is
+        on.
+      default: true
+      selector:
+        boolean: {}
+    stale_persistent:
+      name: Stale Devices -- Persistent Notification
+      description: >-
+        Also show stale-device pushes in Home Assistant's notification panel (the bell in
+        the sidebar), through the one "Portainer Maintenance" summary entry.
+        On by default. Turn off to leave this category out of that summary
+        and its total.
+      default: true
       selector:
         boolean: {}
 
@@ -170,6 +251,27 @@ blueprint:
         exclusive to Portainer. Off by default -- a dangling-image count
         is never urgent enough to warrant this.
       default: false
+      selector:
+        boolean: {}
+
+    cleanup_mobile:
+      name: Cleanup -- Mobile Notification
+      description: >-
+        Send 'images to clean up' pushes as a push to the device(s) above. On by default. Turn
+        off to stop them reaching your phone at all; the channel and Bypass
+        Do Not Disturb settings for this category only apply while this is
+        on.
+      default: true
+      selector:
+        boolean: {}
+    cleanup_persistent:
+      name: Cleanup -- Persistent Notification
+      description: >-
+        Also show 'images to clean up' pushes in Home Assistant's notification panel (the bell in
+        the sidebar), through the one "Portainer Maintenance" summary entry.
+        On by default. Turn off to leave this category out of that summary
+        and its total.
+      default: true
       selector:
         boolean: {}
 
@@ -206,6 +308,15 @@ blueprint:
 trace:
   stored_traces: 50
 
+# Queued, not the default "single": the integration's "Update performed" and
+# "Stack restart needed" events can arrive together (an "Update all" finishes
+# several containers within moments of each other), and in single mode every
+# event arriving while a run is still sending its pushes would be dropped.
+# The startup recheck's wait (up to 5 minutes) delays queued runs rather than
+# losing them.
+mode: queued
+max: 10
+
 trigger:
   - id: update_available
     trigger: state
@@ -231,6 +342,14 @@ trigger:
   - id: updates_reminder
     trigger: time
     at: !input updates_reminder_time
+  # Fired by the integration's perform_update service once an update is
+  # finished (see __init__.py: EVENT_UPDATE_DONE / EVENT_STACK_RESTART_NEEDED).
+  - id: update_done
+    trigger: event
+    event_type: portainer_maintenance_update_done
+  - id: stack_restart_needed
+    trigger: event
+    event_type: portainer_maintenance_stack_restart_needed
 
 action:
   - variables:
@@ -254,6 +373,35 @@ action:
       cleanup_channel_name: !input cleanup_channel
       cleanup_bypass_dnd: !input cleanup_bypass_dnd
       cleanup_channel: "{{ 'alarm_stream' if cleanup_bypass_dnd else cleanup_channel_name }}"
+      # Per-category Mobile / Persistent toggles. A category with Mobile off
+      # gets an empty device list, so its pushes simply have nobody to go to.
+      updates_mobile: !input updates_mobile
+      updates_persistent: !input updates_persistent
+      trouble_mobile: !input trouble_mobile
+      trouble_persistent: !input trouble_persistent
+      stale_mobile: !input stale_mobile
+      stale_persistent: !input stale_persistent
+      cleanup_mobile: !input cleanup_mobile
+      cleanup_persistent: !input cleanup_persistent
+      updates_notify_services: "{{ notify_services if updates_mobile else [] }}"
+      trouble_notify_services: "{{ notify_services if trouble_mobile else [] }}"
+      stale_notify_services: "{{ notify_services if stale_mobile else [] }}"
+      cleanup_notify_services: "{{ notify_services if cleanup_mobile else [] }}"
+      # How each category looks: a title emoji, plus the Android status-bar
+      # icon (a Material Design icon) and its color. The colors are the
+      # sidecar's tab-badge colors.
+      updates_emoji: "ℹ️"
+      updates_icon: "mdi:information"
+      updates_color: "#0b74de"
+      trouble_emoji: "❗"
+      trouble_icon: "mdi:alert-circle"
+      trouble_color: "#d0342c"
+      stale_emoji: "⚠️"
+      stale_icon: "mdi:alert"
+      stale_color: "#a15c00"
+      cleanup_emoji: "⚠️"
+      cleanup_icon: "mdi:alert"
+      cleanup_color: "#a15c00"
   - choose:
       # 1. Notify on newly-appeared update-available entries
       #    (diffs sensor.portainer_updates_pending's `items` list --
@@ -274,15 +422,17 @@ action:
                 - variables:
                     new_item: "{{ repeat.item }}"
                 - repeat:
-                    for_each: "{{ notify_services }}"
+                    for_each: "{{ updates_notify_services }}"
                     sequence:
                       - action: "{{ repeat.item }}"
                         data:
-                          title: "Update available"
+                          title: "{{ updates_emoji }} Update available"
                           message: "{{ new_item.name }}"
                           data:
                             tag: "{{ new_item.entity }}"
                             channel: "{{ updates_channel }}"
+                            notification_icon: "{{ updates_icon }}"
+                            color: "{{ updates_color }}"
                             actions:
                               - action: "EXECUTE_UPDATE_{{ new_item.entity }}"
                                 title: "Update now"
@@ -355,16 +505,18 @@ action:
           - condition: template
             value_template: "{{ states('sensor.portainer_updates_pending') | int(0) > 0 }}"
           - repeat:
-              for_each: "{{ notify_services }}"
+              for_each: "{{ updates_notify_services }}"
               sequence:
                 - action: "{{ repeat.item }}"
                   data:
-                    title: "Updates available (recheck)"
+                    title: "{{ updates_emoji }} Updates available (recheck)"
                     message: >
                       {{ states('sensor.portainer_updates_pending') }} pending update{{ 's' if states('sensor.portainer_updates_pending') | int != 1 else '' }} found at startup. Tap to review.
                     data:
                       tag: "portainer_updates_pending"
                       channel: "{{ updates_channel }}"
+                      notification_icon: "{{ updates_icon }}"
+                      color: "{{ updates_color }}"
                       clickAction: "{{ states('sensor.portainer_actions_url') }}"
                       url: "{{ states('sensor.portainer_actions_url') }}"
                       # (1.3.1) Every notification in this system is
@@ -390,16 +542,18 @@ action:
             value_template: "{{ updates_reminder_enabled and states('sensor.portainer_updates_pending') | int(0) > 0 }}"
         sequence:
           - repeat:
-              for_each: "{{ notify_services }}"
+              for_each: "{{ updates_notify_services }}"
               sequence:
                 - action: "{{ repeat.item }}"
                   data:
-                    title: "Updates still pending"
+                    title: "{{ updates_emoji }} Updates still pending"
                     message: >
                       {{ states('sensor.portainer_updates_pending') }} pending update{{ 's' if states('sensor.portainer_updates_pending') | int != 1 else '' }}. Tap to review.
                     data:
                       tag: "portainer_updates_pending"
                       channel: "{{ updates_channel }}"
+                      notification_icon: "{{ updates_icon }}"
+                      color: "{{ updates_color }}"
                       clickAction: "{{ states('sensor.portainer_actions_url') }}"
                       url: "{{ states('sensor.portainer_actions_url') }}"
                       actions:
@@ -429,16 +583,18 @@ action:
               {{ trigger.to_state.state | int(0) > (trigger.from_state.state | int(0) if trigger.from_state else 0) }}
         sequence:
           - repeat:
-              for_each: "{{ notify_services }}"
+              for_each: "{{ trouble_notify_services }}"
               sequence:
                 - action: "{{ repeat.item }}"
                   data:
-                    title: "Portainer trouble"
+                    title: "{{ trouble_emoji }} Portainer trouble"
                     message: >
                       {{ trigger.to_state.state }} item{{ 's' if trigger.to_state.state | int != 1 else '' }} need attention. Tap to review.
                     data:
                       tag: "portainer_trouble"
                       channel: "{{ trouble_channel }}"
+                      notification_icon: "{{ trouble_icon }}"
+                      color: "{{ trouble_color }}"
                       clickAction: "{{ states('sensor.portainer_actions_url') }}#needs-remediation"
                       url: "{{ states('sensor.portainer_actions_url') }}#needs-remediation"
                       # (1.3.1) See the matching note on branch 5 above.
@@ -455,16 +611,18 @@ action:
               {{ trigger.to_state.state | int(0) > (trigger.from_state.state | int(0) if trigger.from_state else 0) }}
         sequence:
           - repeat:
-              for_each: "{{ notify_services }}"
+              for_each: "{{ stale_notify_services }}"
               sequence:
                 - action: "{{ repeat.item }}"
                   data:
-                    title: "Stale Portainer devices"
+                    title: "{{ stale_emoji }} Stale Portainer devices"
                     message: >
                       {{ trigger.to_state.state }} device{{ 's' if trigger.to_state.state | int != 1 else '' }} look gone. Tap to review.
                     data:
                       tag: "portainer_stale_devices"
                       channel: "{{ stale_channel }}"
+                      notification_icon: "{{ stale_icon }}"
+                      color: "{{ stale_color }}"
                       clickAction: "{{ states('sensor.portainer_actions_url') }}"
                       url: "{{ states('sensor.portainer_actions_url') }}"
                       # (1.3.1) See the matching note on branch 5 above.
@@ -487,20 +645,99 @@ action:
               {{ trigger.to_state.state | int(0) > (trigger.from_state.state | int(0) if trigger.from_state else 0) }}
         sequence:
           - repeat:
-              for_each: "{{ notify_services }}"
+              for_each: "{{ cleanup_notify_services }}"
               sequence:
                 - action: "{{ repeat.item }}"
                   data:
-                    title: "Portainer cleanup"
+                    title: "{{ cleanup_emoji }} Portainer cleanup"
                     message: >
                       {{ trigger.to_state.state }} image{{ 's' if trigger.to_state.state | int != 1 else '' }} to clean up. Tap to review.
                     data:
                       tag: "portainer_cleanup"
                       channel: "{{ cleanup_channel }}"
+                      notification_icon: "{{ cleanup_icon }}"
+                      color: "{{ cleanup_color }}"
                       clickAction: "{{ states('sensor.portainer_actions_url') }}#cleanup"
                       url: "{{ states('sensor.portainer_actions_url') }}#cleanup"
                       # (1.3.1) See the matching note on branch 5 above.
                       actions:
+                        - action: "dismiss"
+                          title: "Dismiss"
+
+      # 8b. (new) An update finished. The integration's perform_update
+      #     service fires portainer_maintenance_update_done; this builds the
+      #     bell entry and the phone push, so they follow the Updates
+      #     category's channel and toggles (they used to be sent straight
+      #     from __init__.py, on the phone's default channel, with no
+      #     toggles).
+      - conditions:
+          - condition: trigger
+            id: update_done
+        sequence:
+          - if:
+              - condition: template
+                value_template: "{{ updates_persistent }}"
+            then:
+              - action: persistent_notification.dismiss
+                data:
+                  notification_id: "{{ trigger.event.data.notification_id }}"
+              - action: persistent_notification.create
+                data:
+                  notification_id: "{{ trigger.event.data.notification_id }}"
+                  title: "{{ updates_emoji }} Update performed: {{ trigger.event.data.device_name }}"
+                  message: "Updated on {{ trigger.event.data.finished_at }}"
+          - repeat:
+              for_each: "{{ updates_notify_services }}"
+              sequence:
+                - action: "{{ repeat.item }}"
+                  data:
+                    title: "{{ updates_emoji }} Update performed"
+                    message: "{{ trigger.event.data.device_name }} updated on {{ trigger.event.data.finished_at }}."
+                    data:
+                      tag: "{{ trigger.event.data.tag }}"
+                      channel: "{{ updates_channel }}"
+                      notification_icon: "{{ updates_icon }}"
+                      color: "{{ updates_color }}"
+                      actions:
+                        - action: "dismiss"
+                          title: "Dismiss"
+
+      # 8c. (new) An update finished but its stack needs a restart (the known
+      #     network_mode:service:X conflict). Same arrangement as 8b, under
+      #     the Trouble category; the push's action opens the sidecar on the
+      #     Needs Remediation tab.
+      - conditions:
+          - condition: trigger
+            id: stack_restart_needed
+        sequence:
+          - if:
+              - condition: template
+                value_template: "{{ trouble_persistent }}"
+            then:
+              - action: persistent_notification.dismiss
+                data:
+                  notification_id: "{{ trigger.event.data.notification_id }}"
+              - action: persistent_notification.create
+                data:
+                  notification_id: "{{ trigger.event.data.notification_id }}"
+                  title: "{{ trouble_emoji }} Stack restart needed: {{ trigger.event.data.device_name }}"
+                  message: "{{ trigger.event.data.message }}"
+          - repeat:
+              for_each: "{{ trouble_notify_services }}"
+              sequence:
+                - action: "{{ repeat.item }}"
+                  data:
+                    title: "{{ trouble_emoji }} Stack restart needed"
+                    message: "{{ trigger.event.data.message }}"
+                    data:
+                      tag: "{{ trigger.event.data.tag }}"
+                      channel: "{{ trouble_channel }}"
+                      notification_icon: "{{ trouble_icon }}"
+                      color: "{{ trouble_color }}"
+                      actions:
+                        - action: "URI"
+                          title: "Open Needs Remediation"
+                          uri: "{{ states('sensor.portainer_actions_url') }}#needs-remediation"
                         - action: "dismiss"
                           title: "Dismiss"
 
@@ -531,16 +768,22 @@ action:
   # count (the bell icon, top of the sidebar) is native and needs no
   # third-party plugin, unlike a badge on the panel item itself, which
   # HA's frontend doesn't expose to custom integrations at all. Recomputed
-  # after every run regardless of which trigger fired -- cheap (three
+  # after every run regardless of which trigger fired -- cheap (four
   # state reads, one service call) and keeps this always correct off the
   # sensors' current values rather than needing to track deltas per
-  # branch above.
+  # branch above. (new) A category whose Persistent toggle is off counts as
+  # 0 here, so it is left out of the summary and its total; the title's
+  # emoji is the most serious category still in it.
   - variables:
-      total_action_items: >-
-        {{ (states('sensor.portainer_updates_pending') | int(0))
-           + (states('sensor.portainer_trouble') | int(0))
-           + (states('sensor.portainer_stale_devices') | int(0))
-           + (states('sensor.portainer_cleanup') | int(0)) }}
+      summary_updates_n: "{{ states('sensor.portainer_updates_pending') | int(0) if updates_persistent else 0 }}"
+      summary_trouble_n: "{{ states('sensor.portainer_trouble') | int(0) if trouble_persistent else 0 }}"
+      summary_stale_n: "{{ states('sensor.portainer_stale_devices') | int(0) if stale_persistent else 0 }}"
+      summary_cleanup_n: "{{ states('sensor.portainer_cleanup') | int(0) if cleanup_persistent else 0 }}"
+      total_action_items: "{{ summary_updates_n + summary_trouble_n + summary_stale_n + summary_cleanup_n }}"
+      summary_emoji: >-
+        {{ trouble_emoji if summary_trouble_n > 0
+           else stale_emoji if (summary_stale_n > 0 or summary_cleanup_n > 0)
+           else updates_emoji }}
   - if:
       - condition: template
         value_template: "{{ total_action_items > 0 }}"
@@ -548,12 +791,12 @@ action:
       - action: persistent_notification.create
         data:
           notification_id: portainer_maintenance_action_items
-          title: "Portainer Maintenance"
+          title: "{{ summary_emoji }} Portainer Maintenance"
           message: |-
-            {%- set updates_n = states('sensor.portainer_updates_pending') | int(0) -%}
-            {%- set stale_n = states('sensor.portainer_stale_devices') | int(0) -%}
-            {%- set trouble_n = states('sensor.portainer_trouble') | int(0) -%}
-            {%- set cleanup_n = states('sensor.portainer_cleanup') | int(0) -%}
+            {%- set updates_n = summary_updates_n -%}
+            {%- set stale_n = summary_stale_n -%}
+            {%- set trouble_n = summary_trouble_n -%}
+            {%- set cleanup_n = summary_cleanup_n -%}
             {%- set parts = [] -%}
             {%- if updates_n > 0 -%}{%- set parts = parts + [updates_n ~ ' image update' ~ ('s' if updates_n != 1 else '')] -%}{%- endif -%}
             {%- if trouble_n > 0 -%}{%- set parts = parts + [trouble_n ~ ' item' ~ ('s' if trouble_n != 1 else '') ~ ' in trouble'] -%}{%- endif -%}
