@@ -44,7 +44,9 @@ from homeassistant.helpers.event import async_call_later
 from homeassistant.helpers.update_coordinator import CoordinatorEntity, DataUpdateCoordinator
 
 from .const import (
+    API_LEVEL,
     DOMAIN,
+    RUNNING_VERSION,
     SENSOR_ACTIONS_URL,
     SENSOR_CLEANUP,
     SENSOR_STALE_DEVICES,
@@ -2090,6 +2092,15 @@ class PortainerActionsUrlSensor(SensorEntity):
             name="Portainer Maintenance",
             entry_type=DeviceEntryType.SERVICE,
         )
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        """What the sidecar reads to check it can work with this integration:
+        the API level (see const.API_LEVEL) and the release this code is
+        running (const.RUNNING_VERSION -- unchanged by a HACS download until
+        Home Assistant restarts). An integration older than this feature has
+        neither attribute, which the sidecar treats as "too old"."""
+        return {"api_level": API_LEVEL, "version": RUNNING_VERSION}
 
 
 async def async_setup_entry(
