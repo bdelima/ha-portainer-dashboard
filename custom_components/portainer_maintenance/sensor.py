@@ -61,6 +61,17 @@ _LOGGER = logging.getLogger(__name__)
 # after startup. Used by the Trouble items and by Stale Devices.
 SETTLE_SECONDS = 120
 
+# Cleanup: how long after a change to one of a host's source sensors the
+# Cleanup numbers are re-read (a burst of changes shares one timer, so the
+# three sensors core updates together are read together), and how often they
+# are re-read regardless (the backstop that turns a host which is still not
+# ready into "unavailable").
+CLEANUP_DEBOUNCE_SECONDS = 5
+CLEANUP_BACKSTOP_SECONDS = 300
+CLEANUP_READY = "ready"
+CLEANUP_COMPUTING = "computing"
+CLEANUP_UNAVAILABLE = "unavailable"
+
 
 # ---------------------------------------------------------------------------
 # Shared registry helpers -- Python equivalents of the Jinja template
@@ -1518,6 +1529,25 @@ class PortainerTroubleCoordinator(DataUpdateCoordinator[list[dict]]):
         return found
 
 
+def _cleanup_source_ready(hass: HomeAssistant, entity_id: str | None, *, unknown_is_value: bool) -> bool:
+    """Whether one of a host's Cleanup source sensors has a usable state yet.
+
+    No entity at all (never created, disabled) is ready: there is nothing to
+    wait for, and the Cleanup item just carries nulls for it as before. An
+    entity with no state yet, or Unavailable, is not ready. Unknown is not
+    ready for the image and container counts; for the reclaimable figure
+    (`unknown_is_value`) core reports Unknown when nothing can be reclaimed,
+    which is the value 0 (see _size_state), so it is ready."""
+    if entity_id is None:
+        return True
+    state = hass.states.get(entity_id)
+    if state is None or state.state in (None, STATE_UNAVAILABLE):
+        return False
+    if state.state == "unknown":
+        return unknown_is_value
+    return True
+
+
 class PortainerStaleCoordinator(DataUpdateCoordinator[list[dict]]):
     """Devices Portainer no longer reports, found by walking the device tree
     (endpoint -> stack -> container) instead of by how long they have been
@@ -1786,37 +1816,172 @@ class PortainerCleanupCoordinator(DataUpdateCoordinator[list[dict]]):
     through as-is: the webapp uses images_count == 0 to disable both image
     prune actions (unused_estimate can be 0 while images still exist, e.g.
     when several containers share an image, so it can't tell "no images"
-    from "nothing beyond what's running"). None when unknown."""
+    from "nothing beyond what's running"). None when unknown.
+
+    Readiness, per host. Each item carries `status`:
+
+      - "ready": the host's image count, container count and reclaimable-space
+        sensors all have a usable state (Unknown reclaimable is a usable 0).
+        Only ready hosts add their `unused_estimate` to the sensor's value.
+      - "computing": at least one of them has no usable state yet, which is
+        what every host looks like for a short while after a restart. The host
+        adds 0 to the sensor, so nothing is reported (no bell notification, no
+        phone push) from numbers that are about to change.
+      - "unavailable": it was still not ready when the backstop refresh ran
+        (every CLEANUP_BACKSTOP_SECONDS), so it is not just slow to start. Also
+        adds 0, and stays unavailable until it is ready.
+
+    Hosts are independent: one host that is down never holds back another.
+
+    Event driven, with a backstop. A change to any of a host's three source
+    sensors re-reads everything after CLEANUP_DEBOUNCE_SECONDS (one timer for a
+    burst, not extended by later changes), so a host becomes ready, and the
+    numbers follow a prune, as soon as core reports it rather than at the next
+    poll. An entity registry change (a host or sensor added or removed)
+    does the same. The backstop re-reads every CLEANUP_BACKSTOP_SECONDS anyway.
+    """
 
     def __init__(self, hass: HomeAssistant) -> None:
-        super().__init__(hass, _LOGGER, name=SENSOR_CLEANUP, update_interval=timedelta(minutes=5))
+        super().__init__(hass, _LOGGER, name=SENSOR_CLEANUP, update_interval=None)
+        self._unsubs: list[CALLBACK_TYPE] = []
+        self._timer: CALLBACK_TYPE | None = None
+        self._timer_due = 0.0
+        self._backstop_timer: CALLBACK_TYPE | None = None
+        self._backstop_pending = False
+        self._watched: set[str] = set()
+        self._unavailable_hosts: set[str] = set()
+
+    # -- event wiring ------------------------------------------------------
+
+    @callback
+    def async_start(self) -> None:
+        """Start listening and arm the backstop. Call once, after the first refresh."""
+        self._unsubs = [
+            self.hass.bus.async_listen(
+                EVENT_STATE_CHANGED,
+                self._handle_source_change,
+                event_filter=self._is_source_change,
+            ),
+            self.hass.bus.async_listen(er.EVENT_ENTITY_REGISTRY_UPDATED, self._handle_registry_updated),
+        ]
+        self._arm_backstop()
+
+    @callback
+    def async_stop(self) -> None:
+        for unsub in self._unsubs:
+            unsub()
+        self._unsubs = []
+        if self._timer is not None:
+            self._timer()
+            self._timer = None
+        if self._backstop_timer is not None:
+            self._backstop_timer()
+            self._backstop_timer = None
+
+    @callback
+    def _is_source_change(self, event_or_data: Any) -> bool:
+        """Cheap pre-filter: a real change of state of one of the sensors the
+        Cleanup numbers are read from. Takes the event or its data, whichever
+        this Home Assistant version passes to an event filter."""
+        data: Mapping[str, Any] = getattr(event_or_data, "data", event_or_data)
+        if data.get("entity_id") not in self._watched:
+            return False
+        old, new = data.get("old_state"), data.get("new_state")
+        return (old.state if old is not None else None) != (new.state if new is not None else None)
+
+    @callback
+    def _handle_source_change(self, _event: Any) -> None:
+        self._schedule_scan(CLEANUP_DEBOUNCE_SECONDS)
+
+    @callback
+    def _handle_registry_updated(self, event: Any) -> None:
+        data: Mapping[str, Any] = getattr(event, "data", event)
+        if data.get("action") != "remove":
+            entry = er.async_get(self.hass).async_get(data.get("entity_id"))
+            if entry is None or entry.platform != "portainer":
+                return
+        self._schedule_scan(CLEANUP_DEBOUNCE_SECONDS)
+
+    @callback
+    def _schedule_scan(self, delay: float) -> None:
+        due = self.hass.loop.time() + delay
+        if self._timer is not None:
+            if self._timer_due <= due:
+                return
+            self._timer()
+        self._timer_due = due
+        self._timer = async_call_later(self.hass, delay, self._timer_fired)
+
+    @callback
+    def _timer_fired(self, _now: datetime) -> None:
+        self._timer = None
+        self.hass.async_create_task(self.async_refresh())
+
+    @callback
+    def _arm_backstop(self) -> None:
+        self._backstop_timer = async_call_later(self.hass, CLEANUP_BACKSTOP_SECONDS, self._backstop_fired)
+
+    @callback
+    def _backstop_fired(self, _now: datetime) -> None:
+        self._backstop_timer = None
+        self._arm_backstop()
+        self.hass.async_create_task(self._backstop_refresh())
+
+    async def _backstop_refresh(self) -> None:
+        self._backstop_pending = True
+        await self.async_refresh()
+
+    # -- the read ----------------------------------------------------------
 
     async def _async_update_data(self) -> list[dict]:
         entity_reg = er.async_get(self.hass)
         device_reg = dr.async_get(self.hass)
         found: list[dict] = []
         refreshed_at = dt_util.utcnow().isoformat(timespec="seconds")
+        backstop = self._backstop_pending
+        self._backstop_pending = False
+        watched: set[str] = set()
+        hosts_seen: set[str] = set()
 
         for endpoint_device_id in _discover_endpoint_devices(entity_reg, device_reg):
             host = _device_name(device_reg, endpoint_device_id) or "unknown host"
+            hosts_seen.add(endpoint_device_id)
 
-            images = _numeric_state(self.hass, _endpoint_images_count_entity(entity_reg, endpoint_device_id))
-            containers = _numeric_state(self.hass, _endpoint_containers_count_entity(entity_reg, endpoint_device_id))
+            images_entity = _endpoint_images_count_entity(entity_reg, endpoint_device_id)
+            containers_entity = _endpoint_containers_count_entity(entity_reg, endpoint_device_id)
+            reclaimable_entity = _endpoint_reclaimable_entity(entity_reg, endpoint_device_id)
+            watched.update(e for e in (images_entity, containers_entity, reclaimable_entity) if e)
+
+            images = _numeric_state(self.hass, images_entity)
+            containers = _numeric_state(self.hass, containers_entity)
             unused_estimate = max(int(images) - int(containers), 0) if images is not None and containers is not None else None
             images_count = int(images) if images is not None else None
 
-            reclaimable_mib, reclaimable_unavailable = _size_state(
-                self.hass, _endpoint_reclaimable_entity(entity_reg, endpoint_device_id)
-            )
+            reclaimable_mib, reclaimable_unavailable = _size_state(self.hass, reclaimable_entity)
             volume_usage_mib, _volume_unavailable = _size_state(
                 self.hass, _endpoint_volume_usage_entity(entity_reg, endpoint_device_id)
             )
             volumes_prune_button = _endpoint_volumes_prune_button(entity_reg, endpoint_device_id)
 
+            ready = (
+                _cleanup_source_ready(self.hass, images_entity, unknown_is_value=False)
+                and _cleanup_source_ready(self.hass, containers_entity, unknown_is_value=False)
+                and _cleanup_source_ready(self.hass, reclaimable_entity, unknown_is_value=True)
+            )
+            if ready:
+                status = CLEANUP_READY
+                self._unavailable_hosts.discard(endpoint_device_id)
+            elif backstop or endpoint_device_id in self._unavailable_hosts:
+                status = CLEANUP_UNAVAILABLE
+                self._unavailable_hosts.add(endpoint_device_id)
+            else:
+                status = CLEANUP_COMPUTING
+
             found.append(
                 {
                     "host": host,
                     "device_id": endpoint_device_id,
+                    "status": status,
                     "images_count": images_count,
                     "unused_estimate": unused_estimate,
                     "reclaimable_mib": reclaimable_mib,
@@ -1827,6 +1992,8 @@ class PortainerCleanupCoordinator(DataUpdateCoordinator[list[dict]]):
                 }
             )
 
+        self._watched = watched
+        self._unavailable_hosts &= hosts_seen
         return found
 
 
@@ -1872,8 +2039,9 @@ class _PortainerListSensor(CoordinatorEntity[DataUpdateCoordinator], SensorEntit
 
 class _PortainerCleanupSensor(CoordinatorEntity[DataUpdateCoordinator], SensorEntity):
     """Same shape as _PortainerListSensor, but its native_value is the sum
-    of each endpoint's unused_estimate (running total across all hosts),
-    not len(items) -- one entry per endpoint here, not one per issue."""
+    of each ready endpoint's unused_estimate (running total across all ready
+    hosts), not len(items) -- one entry per endpoint here, not one per
+    issue."""
 
     _attr_has_entity_name = False
 
@@ -1890,8 +2058,15 @@ class _PortainerCleanupSensor(CoordinatorEntity[DataUpdateCoordinator], SensorEn
 
     @property
     def native_value(self) -> int:
+        # Only hosts whose numbers are ready count: a host that is still
+        # computing (or unavailable) adds 0, so nothing is reported from
+        # numbers that are about to change. Hosts are independent.
         items = self.coordinator.data or []
-        return sum(item.get("unused_estimate") or 0 for item in items)
+        return sum(
+            item.get("unused_estimate") or 0
+            for item in items
+            if item.get("status", CLEANUP_READY) == CLEANUP_READY
+        )
 
     @property
     def extra_state_attributes(self) -> dict:
@@ -1936,6 +2111,11 @@ async def async_setup_entry(
     # or from unavailable, or a device/entity registry entry changes.
     stale_coordinator.async_start()
     entry.async_on_unload(stale_coordinator.async_stop)
+
+    # Cleanup isn't polled either: it re-reads when one of a host's source
+    # sensors changes, with a backstop every few minutes (see the coordinator).
+    cleanup_coordinator.async_start()
+    entry.async_on_unload(cleanup_coordinator.async_stop)
 
     hass.data[DOMAIN][entry.entry_id]["coordinators"] = {
         "updates": updates_coordinator,
