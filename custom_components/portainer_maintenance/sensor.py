@@ -70,6 +70,25 @@ SETTLE_SECONDS = 120
 # settle on "off" (installed) or "on" (the install did not take).
 UPDATES_DEBOUNCE_SECONDS = 5
 UPDATES_CONFIRM_MAX_SECONDS = 420
+# Updates: after perform_update returns, how long core's update entity may stay
+# "on" without ever having gone "on" -> "unknown" before the container is
+# called out of sync with Portainer's state. A real update flips through
+# "unknown" while the container restarts; one that does not is stuck until the
+# stack is restarted.
+UPDATES_STUCK_WINDOW_SECONDS = 300
+
+# What a row says while it waits for a stack restart. Same wording for both
+# causes; the network_mode one adds its known reason.
+AWAITING_RESTART_TEXT = "Awaiting stack restart"
+AWAITING_RESTART_DETAIL = (
+    "Container was successfully updated, but is out of sync with Portainer's state. "
+    "Restart the stack at your earliest convenience."
+)
+AWAITING_RESTART_DETAIL_IMAGE_REFERENCE = (
+    AWAITING_RESTART_DETAIL
+    + " (Its image reference has not settled: a known Portainer/Docker limitation for "
+    "containers that share another container's network, network_mode: service:<other>.)"
+)
 
 # Cleanup: how long after a change to one of a host's source sensors the
 # Cleanup numbers are re-read (a burst of changes shares one timer, so the
@@ -280,9 +299,10 @@ def _find_stuck_containers(
     moment the image entity reflects a normal tag again -- no separate
     "auto-clear" logic, no dismiss control, just the same check re-run.
 
-    Used by PortainerTroubleCoordinator (to report the item) and
-    PortainerUpdatesCoordinator (to badge the owning stack's row) -- one
-    shared detection, not two that could drift."""
+    Used by PortainerUpdatesCoordinator (a stacked container is listed as
+    awaiting a stack restart) and PortainerTroubleCoordinator (an unstacked
+    one, which has no restart to offer, is reported there) -- one shared
+    detection, not two that could drift."""
     portainer_ids = _portainer_entity_ids(entity_reg)
     image_entities = [
         e for e in portainer_ids if e.startswith("sensor.") and _IMAGE_ENTITY_SUFFIX_RE.search(e)
@@ -317,16 +337,47 @@ def _find_stuck_containers(
     return stuck
 
 
-def _stacks_with_open_trouble(hass: HomeAssistant, entity_reg: er.EntityRegistry, device_reg: dr.DeviceRegistry) -> set[str]:
-    """Stack device_ids that currently have a stuck container under them --
-    used by PortainerUpdatesCoordinator to badge that stack's row, so
-    "other pending updates for this stack" don't get installed blind while
-    a restart is still owed. Calls the same _find_stuck_containers as the
-    Trouble sensor itself rather than a separate check."""
+def _container_update_entity_id(entity_reg: er.EntityRegistry, container_device_id: str | None) -> str | None:
+    """The core update.* entity on a container's own device, if there is one."""
+    if container_device_id is None:
+        return None
+    for entity in er.async_entries_for_device(entity_reg, container_device_id):
+        if entity.entity_id.startswith("update.") and entity.platform == "portainer":
+            return entity.entity_id
+    return None
+
+
+def _awaiting_restart_item(
+    entity_reg: er.EntityRegistry,
+    device_reg: dr.DeviceRegistry,
+    container_device_id: str,
+    reason: str,
+) -> dict | None:
+    """A container whose update went through but whose stack still needs a
+    restart, as an item for the Updates sensor's `awaiting_restart` list. None
+    when the container is not in a stack: there is nothing to restart from here.
+
+    `reason` is "out_of_sync" (the update entity never flipped, see
+    PortainerUpdatesCoordinator) or "image_reference" (the known
+    network_mode:service:X conflict, see _find_stuck_containers)."""
+    stack_name, switch_entity_id = _stack_info(device_reg, entity_reg, container_device_id)
+    if not stack_name:
+        return None
+    root_id = _walk_to_root(device_reg, container_device_id)
+    host = _device_name(device_reg, root_id) or "unknown host"
+    container_name = _device_name(device_reg, container_device_id) or container_device_id
     return {
-        item["stack_device_id"]
-        for item in _find_stuck_containers(hass, entity_reg, device_reg)
-        if item["stack_device_id"]
+        "entity": _container_update_entity_id(entity_reg, container_device_id),
+        "device_id": container_device_id,
+        "name": f"{container_name} ({host})",
+        "secondary_info": AWAITING_RESTART_TEXT,
+        "detail": AWAITING_RESTART_DETAIL_IMAGE_REFERENCE if reason == "image_reference" else AWAITING_RESTART_DETAIL,
+        "reason": reason,
+        "host": host,
+        "host_device_id": root_id,
+        "stack_name": stack_name,
+        "stack_device_id": _stack_device_id(device_reg, container_device_id),
+        "stack_switch_entity_id": switch_entity_id,
     }
 
 
@@ -1014,6 +1065,18 @@ class PortainerUpdatesCoordinator(DataUpdateCoordinator[list[dict]]):
     "on" -> "unknown" stays listed, flagged `confirming: true`, until core
     reaches either state (or UPDATES_CONFIRM_MAX_SECONDS passes). An entity
     that is "unknown" without having been "on" first is not listed.
+
+    A third state is kept for an update the dashboard itself started
+    (perform_update tells this coordinator when it starts, returns or fails).
+    If core's entity never goes through "unknown" and is still "on"
+    UPDATES_STUCK_WINDOW_SECONDS after the call returned, the container was
+    updated but Portainer's own record of it is out of sync, and a stack
+    restart clears that. It is then taken out of `items` and listed in the
+    `awaiting_restart` attribute instead, as is a stacked container stuck on
+    the known network_mode:service:X conflict (see _find_stuck_containers).
+    `items` stays "updates that can be installed", so the sensor's count and the
+    reminders built on it are not inflated. In memory only: after a Home
+    Assistant restart a stuck row shows its plain "Update available" state again.
     """
 
     def __init__(self, hass: HomeAssistant) -> None:
@@ -1025,6 +1088,12 @@ class PortainerUpdatesCoordinator(DataUpdateCoordinator[list[dict]]):
         self._expiry_timer: CALLBACK_TYPE | None = None
         # entity_id -> loop time at which it went "on" -> "unknown"
         self._confirming: dict[str, float] = {}
+        # entity_id -> {"returned": loop time perform_update returned (None
+        # while it runs), "saw_unknown": core's entity went through "unknown"}
+        self._applied: dict[str, dict] = {}
+        # Containers whose stack needs a restart; exposed as an attribute of
+        # the sensor (see _PortainerListSensor).
+        self.awaiting_restart: list[dict] = []
 
     # -- follow core's update entities -------------------------------------
 
@@ -1050,15 +1119,22 @@ class PortainerUpdatesCoordinator(DataUpdateCoordinator[list[dict]]):
         self._timer = None
         self._expiry_timer = None
         self._confirming.clear()
+        self._applied.clear()
 
     @callback
     def _is_update_change(self, event_or_data: Any) -> bool:
         """Cheap pre-filter: a real change of state of a core Portainer
-        update entity. Takes the event or its data, whichever this Home
-        Assistant version passes to an event filter."""
+        update entity, or of a Portainer container's image or state sensor
+        (what the network_mode detection reads). Takes the event or its data,
+        whichever this Home Assistant version passes to an event filter."""
         data: Mapping[str, Any] = getattr(event_or_data, "data", event_or_data)
         entity_id = data.get("entity_id")
-        if not isinstance(entity_id, str) or not entity_id.startswith("update."):
+        if not isinstance(entity_id, str):
+            return False
+        if not entity_id.startswith("update.") and not (
+            entity_id.startswith("sensor.")
+            and (_IMAGE_ENTITY_SUFFIX_RE.search(entity_id) or _STATE_ENTITY_SUFFIX_RE.search(entity_id))
+        ):
             return False
         old, new = data.get("old_state"), data.get("new_state")
         if (old.state if old is not None else None) == (new.state if new is not None else None):
@@ -1070,6 +1146,10 @@ class PortainerUpdatesCoordinator(DataUpdateCoordinator[list[dict]]):
     def _handle_update_change(self, event: Any) -> None:
         data: Mapping[str, Any] = getattr(event, "data", event)
         entity_id = data["entity_id"]
+        if not entity_id.startswith("update."):
+            # An image or state sensor: only the awaiting-restart list reads it.
+            self._schedule_scan(UPDATES_DEBOUNCE_SECONDS)
+            return
         old, new = data.get("old_state"), data.get("new_state")
         if old is not None and new is not None and old.state == "on" and new.state == "unknown":
             self._confirming[entity_id] = self.hass.loop.time()
@@ -1078,7 +1158,57 @@ class PortainerUpdatesCoordinator(DataUpdateCoordinator[list[dict]]):
             # "off" (installed), "on" (did not take), unavailable, removed:
             # core has settled, so the keep-alive is over.
             self._confirming.pop(entity_id, None)
+        applied = self._applied.get(entity_id)
+        if applied is not None:
+            if new is not None and new.state == "unknown":
+                applied["saw_unknown"] = True
+            elif new is None or new.state != "on" or applied["saw_unknown"]:
+                # Settled: installed ("off"), gone, or flipped through
+                # "unknown" and back to "on" (the install did not take, which
+                # is the plain "Update available" case).
+                self._applied.pop(entity_id, None)
         self._schedule_scan(UPDATES_DEBOUNCE_SECONDS)
+
+    # -- updates the dashboard itself runs (called by perform_update) ---------
+
+    @callback
+    def note_install_started(self, entity_id: str) -> None:
+        """perform_update is about to recreate this container."""
+        self._applied[entity_id] = {"returned": None, "saw_unknown": False}
+
+    @callback
+    def note_install_returned(self, entity_id: str) -> None:
+        """perform_update's recreate went through. From here the entity has
+        UPDATES_STUCK_WINDOW_SECONDS to settle."""
+        applied = self._applied.get(entity_id)
+        if applied is None:
+            return
+        state = self.hass.states.get(entity_id)
+        if state is not None and state.state == "unknown":
+            applied["saw_unknown"] = True
+        elif state is None or state.state == "off":
+            self._applied.pop(entity_id, None)
+            return
+        applied["returned"] = self.hass.loop.time()
+        self._arm_expiry()
+
+    @callback
+    def note_install_failed(self, entity_id: str) -> None:
+        """perform_update did not succeed: nothing was applied."""
+        self._applied.pop(entity_id, None)
+
+    def _is_out_of_sync(self, entity_id: str, state: Any, now_loop: float) -> bool:
+        """The update was applied, yet the entity never went through "unknown"
+        and is still "on" once the window has passed."""
+        applied = self._applied.get(entity_id)
+        return bool(
+            state is not None
+            and state.state == "on"
+            and applied is not None
+            and applied["returned"] is not None
+            and not applied["saw_unknown"]
+            and now_loop - applied["returned"] >= UPDATES_STUCK_WINDOW_SECONDS
+        )
 
     @callback
     def _schedule_scan(self, delay: float) -> None:
@@ -1097,14 +1227,23 @@ class PortainerUpdatesCoordinator(DataUpdateCoordinator[list[dict]]):
 
     @callback
     def _arm_expiry(self) -> None:
-        """Re-read once the oldest confirming entry has used up its time."""
+        """Re-read once the oldest confirming entry has used up its time, or
+        once an applied update's stuck window ends, whichever is first."""
         if self._expiry_timer is not None:
             self._expiry_timer()
             self._expiry_timer = None
-        if not self._confirming:
+        now = self.hass.loop.time()
+        dues = [started + UPDATES_CONFIRM_MAX_SECONDS for started in self._confirming.values()]
+        dues += [
+            applied["returned"] + UPDATES_STUCK_WINDOW_SECONDS
+            for applied in self._applied.values()
+            if applied["returned"] is not None
+            and not applied["saw_unknown"]
+            and applied["returned"] + UPDATES_STUCK_WINDOW_SECONDS > now
+        ]
+        if not dues:
             return
-        due = min(self._confirming.values()) + UPDATES_CONFIRM_MAX_SECONDS
-        delay = max(0.0, due - self.hass.loop.time()) + 1
+        delay = max(0.0, min(dues) - now) + 1
         self._expiry_timer = async_call_later(self.hass, delay, self._expiry_fired)
 
     @callback
@@ -1185,11 +1324,10 @@ class PortainerUpdatesCoordinator(DataUpdateCoordinator[list[dict]]):
         entity_reg = er.async_get(self.hass)
         device_reg = dr.async_get(self.hass)
         found: list[dict] = []
-
-        # Computed once per poll, not once per item -- see
-        # _stacks_with_open_trouble's docstring. Cheap (registry/state
-        # reads only), so no reason to cache it further.
-        stuck_stacks = _stacks_with_open_trouble(self.hass, entity_reg, device_reg)
+        device_by_entity: dict[str, str | None] = {}
+        # container device_id -> awaiting-restart item. The image-reference
+        # cause is added last so it wins over "out_of_sync" for one container.
+        awaiting_by_device: dict[str, dict] = {}
         now_loop = self.hass.loop.time()
 
         for entity_id in _portainer_entity_ids(entity_reg):
@@ -1222,6 +1360,16 @@ class PortainerUpdatesCoordinator(DataUpdateCoordinator[list[dict]]):
             # _find_portainer_self_updates).
             if _portainer_component(self.hass, entity_reg, device_id) is not None:
                 continue
+
+            # The dashboard applied this update and core's entity never moved:
+            # not an update to install again, a stack restart to do.
+            if device_id is not None and self._is_out_of_sync(entity_id, state, now_loop):
+                awaiting = _awaiting_restart_item(entity_reg, device_reg, device_id, "out_of_sync")
+                if awaiting is not None:
+                    awaiting["entity"] = entity_id
+                    awaiting_by_device[device_id] = awaiting
+                    continue
+
             root_id = _walk_to_root(device_reg, device_id)
             host = _device_name(device_reg, root_id) or "unknown host"
             container_name = _device_name(device_reg, device_id) or state.attributes.get(
@@ -1243,11 +1391,6 @@ class PortainerUpdatesCoordinator(DataUpdateCoordinator[list[dict]]):
                 "changelog_url": changelog_url,
                 # (1.3.2) See _github_repo_slug above.
                 "changelog_repo": _github_repo_slug(changelog_url),
-                # (1.3.0) True when this container's stack has an open
-                # "needs a restart" Trouble item -- the webapp badges
-                # the stack's row with this so a fresh install doesn't
-                # get triggered blind while a restart is still owed.
-                "stack_has_open_trouble": bool(stack_dev_id and stack_dev_id in stuck_stacks),
             }
             if confirming:
                 # Present only while true (older webapps ignore it): core's
@@ -1255,7 +1398,27 @@ class PortainerUpdatesCoordinator(DataUpdateCoordinator[list[dict]]):
                 # recreated and core has not yet said whether it took.
                 item["secondary_info"] = "Confirming update…"
                 item["confirming"] = True
+            device_by_entity[entity_id] = device_id
             found.append(item)
+
+        # A stacked container stuck on the known network_mode:service:X
+        # conflict is awaiting a restart too (stateless, see
+        # _find_stuck_containers). Unstacked ones stay on the Trouble sensor.
+        for stuck in _find_stuck_containers(self.hass, entity_reg, device_reg):
+            if not stuck["stack_name"]:
+                continue
+            awaiting = _awaiting_restart_item(entity_reg, device_reg, stuck["device_id"], "image_reference")
+            if awaiting is not None:
+                awaiting_by_device[stuck["device_id"]] = awaiting
+
+        # A container awaiting a restart is not also an update to install.
+        found = [i for i in found if device_by_entity.get(i["entity"]) not in awaiting_by_device]
+        awaiting_stacks = {a["stack_device_id"] for a in awaiting_by_device.values() if a["stack_device_id"]}
+        for item in found:
+            # The webapp badges the stack's row, so installs in a stack that
+            # is owed a restart are not started blind.
+            item["stack_awaiting_restart"] = bool(item["stack_device_id"] and item["stack_device_id"] in awaiting_stacks)
+        self.awaiting_restart = sorted(awaiting_by_device.values(), key=lambda a: (a["host"], a["stack_name"], a["name"]))
 
         self._arm_expiry()
         return found
@@ -1273,15 +1436,14 @@ class PortainerTroubleCoordinator(DataUpdateCoordinator[list[dict]]):
         portainer_maintenance.reload_endpoint directly.
 
       - a container stuck on the known network_mode:service:X daemon-
-        conflict bug (see _find_stuck_containers): kind="stack_restart_needed"
-        when it's part of a real Portainer stack (carries switch_entity_id
-        so the webapp's Restart Stack Now button can call the existing
-        portainer_maintenance.restart_stack service directly), or
-        kind="unstacked_recreate" when it isn't (no remediation possible
-        from here -- info-only, with a fuller "detail" string for the
-        webapp's More Info dialog). Deliberately NOT settled -- see
-        _find_stuck_containers's docstring for why this is stateless and
-        needs no settle window to avoid flapping.
+        conflict bug (see _find_stuck_containers) that is not part of a
+        stack: kind="unstacked_recreate" (no remediation possible from
+        here -- info-only, with a fuller "detail" string for the webapp's
+        More Info dialog). A stacked one is not reported here any more: it
+        is awaiting a stack restart, which is routine, and is listed on the
+        Updates sensor's `awaiting_restart` attribute instead. Deliberately
+        NOT settled -- see _find_stuck_containers's docstring for why this
+        is stateless and needs no settle window to avoid flapping.
 
       - A pending update for one of Portainer's own containers, the server
         or the agent (kind="portainer_self_update", with component="server"
@@ -1298,8 +1460,7 @@ class PortainerTroubleCoordinator(DataUpdateCoordinator[list[dict]]):
     (container_exited, container_unhealthy, unstacked_recreate,
     portainer_self_update). One that has been dismissed (see dismissals.py)
     is left out of the list, and so out of the sensor's count too.
-    endpoint and stack_restart_needed items have real actions and are
-    never dismissible.
+    endpoint items have real actions and are never dismissible.
     """
 
     def __init__(self, hass: HomeAssistant, dismissals: DismissalStore | None = None) -> None:
@@ -1536,44 +1697,34 @@ class PortainerTroubleCoordinator(DataUpdateCoordinator[list[dict]]):
             )
 
         # -- network_mode:service:X daemon-conflict, stuck containers ---
+        # A stacked one is awaiting a stack restart and is listed on the
+        # Updates sensor (see PortainerUpdatesCoordinator); only an unstacked
+        # one, which has nothing to restart from here, is reported here.
         for item in _find_stuck_containers(self.hass, entity_reg, device_reg):
             if item["stack_name"]:
-                found.append(
-                    {
-                        "kind": "stack_restart_needed",
-                        "device_id": item["device_id"],
-                        "host": item["host"],
-                        "host_device_id": item["host_device_id"],
-                        "stack_name": item["stack_name"],
-                        "stack_device_id": item["stack_device_id"],
-                        "switch_entity_id": item["switch_entity_id"],
-                        "name": item["container_name"],
-                        "secondary_info": "Image updated — stack restart needed",
-                    }
-                )
-            else:
-                found.append(
-                    {
-                        "kind": "unstacked_recreate",
-                        "device_id": item["device_id"],
-                        "host": item["host"],
-                        "host_device_id": item["host_device_id"],
-                        "name": item["container_name"],
-                        "secondary_info": "Image updated, tag stale",
-                        "dismiss_key": _dismiss_key("unstacked_recreate", item["device_id"]),
-                        "detail": (
-                            f"{item['container_name']}'s image was pulled successfully, but the "
-                            "container itself couldn't be recreated cleanly -- a known Portainer/"
-                            "Docker limitation for containers sharing another container's network "
-                            "(network_mode: service:<other> or container:<other>, e.g. a VPN sidecar "
-                            "setup). Since this container isn't managed as a Portainer stack, it "
-                            "can't be restarted automatically from here. It most likely lives in a "
-                            "Docker Compose project that Portainer doesn't manage -- recreate it "
-                            "manually (`docker compose up -d` on its host, or via Portainer's own "
-                            "UI) to finish applying the update."
-                        ),
-                    }
-                )
+                continue
+            found.append(
+                {
+                    "kind": "unstacked_recreate",
+                    "device_id": item["device_id"],
+                    "host": item["host"],
+                    "host_device_id": item["host_device_id"],
+                    "name": item["container_name"],
+                    "secondary_info": "Image updated, tag stale",
+                    "dismiss_key": _dismiss_key("unstacked_recreate", item["device_id"]),
+                    "detail": (
+                        f"{item['container_name']}'s image was pulled successfully, but the "
+                        "container itself couldn't be recreated cleanly -- a known Portainer/"
+                        "Docker limitation for containers sharing another container's network "
+                        "(network_mode: service:<other> or container:<other>, e.g. a VPN sidecar "
+                        "setup). Since this container isn't managed as a Portainer stack, it "
+                        "can't be restarted automatically from here. It most likely lives in a "
+                        "Docker Compose project that Portainer doesn't manage -- recreate it "
+                        "manually (`docker compose up -d` on its host, or via Portainer's own "
+                        "UI) to finish applying the update."
+                    ),
+                }
+            )
 
         # -- Portainer's own pending update --------------------------------
         discovered = {
@@ -2163,6 +2314,10 @@ class _PortainerListSensor(CoordinatorEntity[DataUpdateCoordinator], SensorEntit
     @property
     def extra_state_attributes(self) -> dict:
         attrs: dict = {"items": self.coordinator.data or []}
+        # Only the updates coordinator has containers awaiting a stack restart.
+        awaiting = getattr(self.coordinator, "awaiting_restart", None)
+        if awaiting is not None:
+            attrs["awaiting_restart"] = awaiting
         # Only the trouble coordinator has anything suppressed to report.
         suppressed = getattr(self.coordinator, "suppressed", None)
         if suppressed is not None:
