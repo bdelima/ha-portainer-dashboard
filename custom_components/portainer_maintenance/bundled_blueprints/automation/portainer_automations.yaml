@@ -705,7 +705,7 @@ action:
       # 8c. (new) An update finished but its stack needs a restart (the known
       #     network_mode:service:X conflict). Same arrangement as 8b, under
       #     the Trouble category; the push's action opens the sidecar on the
-      #     Needs Remediation tab.
+      #     Updates tab, where the container is listed as awaiting a restart.
       - conditions:
           - condition: trigger
             id: stack_restart_needed
@@ -736,8 +736,8 @@ action:
                       color: "{{ trouble_color }}"
                       actions:
                         - action: "URI"
-                          title: "Open Needs Remediation"
-                          uri: "{{ states('sensor.portainer_actions_url') }}#needs-remediation"
+                          title: "Open Updates"
+                          uri: "{{ states('sensor.portainer_actions_url') }}#updates"
                         - action: "dismiss"
                           title: "Dismiss"
 

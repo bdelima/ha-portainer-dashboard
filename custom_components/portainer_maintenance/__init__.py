@@ -39,6 +39,18 @@ On setup this integration:
    one-tap restart from any one of them made that workflow feel
    disconnected from the others.
 
+   (unreleased) That is routine work, not an error, so a stacked container in
+   this state is now listed on the Updates tab as "Awaiting stack restart"
+   (the Updates sensor's `awaiting_restart` attribute) instead of the Needs
+   Remediation tab; only an unstacked one, which has no stack to restart, stays
+   on Trouble. The same row also covers a dashboard-initiated update whose
+   core update entity never goes through "unknown" and is still "on" five
+   minutes after perform_update returned: the container was updated, but
+   Portainer's own record of it is out of sync until its stack is restarted.
+   perform_update tells the Updates coordinator when it starts, returns or
+   fails (note_install_started / _returned / _failed) so that can be told apart
+   from a normal update.
+
 1d. Registers `portainer_maintenance.reload_endpoint` (1.3.0) -- reloads
    the core `portainer` config entry that owns a given device, the same
    reload Settings -> Devices & Services -> Portainer -> Reload performs.
@@ -587,11 +599,12 @@ async def _async_notify_stack_restart_needed(
     restarted.
 
     (1.3.0) This is purely informational: no inline "Restart Stack Now"
-    action. The actual remediation lives on the dashboard's Needs
-    Remediation tab (a stack can have several independent per-container
-    update notifications in flight at once, and a one-tap restart baked
-    into any one of them made that workflow feel disconnected from the
-    others).
+    action. The actual remediation lives on the dashboard's Updates tab,
+    where the container is listed as awaiting a stack restart (a stack can
+    have several independent per-container update notifications in flight at
+    once, and a one-tap restart baked into any one of them made that workflow
+    feel disconnected from the others). It is routine work, so it is not on
+    the Needs Remediation tab.
 
     Fires EVENT_STACK_RESTART_NEEDED; the bundled blueprint builds the push
     (whose action opens that tab) and the notification-panel entry under the
@@ -614,8 +627,8 @@ async def _async_notify_stack_restart_needed(
     message = (
         f"{device_name} was updated on {now_str}, but its stack needs a restart "
         f"to finish cleanly (known Portainer limitation for containers sharing "
-        f"another container's network). Restart it from the dashboard's Needs "
-        f"Remediation tab whenever convenient."
+        f"another container's network). Restart it from the dashboard's Updates "
+        f"tab whenever convenient."
     )
     hass.bus.async_fire(
         EVENT_STACK_RESTART_NEEDED,
@@ -934,7 +947,15 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         image_before_state = hass.states.get(image_entity_id) if image_entity_id else None
         image_before = image_before_state.state if image_before_state else None
 
+        coordinators = hass.data.get(DOMAIN, {}).get(entry.entry_id, {}).get("coordinators", {})
+        updates_coordinator = coordinators.get("updates")
+
         needs_stack_restart = False
+        # The Updates coordinator watches core's update entity from here on, to
+        # tell an update that went through from one that left the container out
+        # of sync with Portainer's state (see PortainerUpdatesCoordinator).
+        if updates_coordinator is not None:
+            updates_coordinator.note_install_started(update_entity)
         try:
             await hass.services.async_call(
                 "portainer",
@@ -944,6 +965,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             )
         except Exception as err:
             if switch_entity_id is None:
+                if updates_coordinator is not None:
+                    updates_coordinator.note_install_failed(update_entity)
                 _LOGGER.error(
                     "%s.perform_update: recreate_container failed for '%s' "
                     "(standalone container, no owning stack to fall back on) "
@@ -963,24 +986,25 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 RECREATE_WAIT_TIMEOUT_SECONDS,
                 err,
             )
-            needs_stack_restart = await _await_recreate_outcome(
-                hass, image_entity_id, image_before, update_entity
-            )
+            try:
+                needs_stack_restart = await _await_recreate_outcome(
+                    hass, image_entity_id, image_before, update_entity
+                )
+            except Exception:
+                if updates_coordinator is not None:
+                    updates_coordinator.note_install_failed(update_entity)
+                raise
 
-        coordinators = hass.data.get(DOMAIN, {}).get(entry.entry_id, {}).get("coordinators", {})
-        updates_coordinator = coordinators.get("updates")
         if updates_coordinator is not None:
+            if needs_stack_restart:
+                # The known network_mode:service:X conflict: the Updates
+                # sensor lists it as awaiting a restart from the container's
+                # own image sensor (stateless, see sensor.py's
+                # _find_stuck_containers), so there is nothing to watch for.
+                updates_coordinator.note_install_failed(update_entity)
+            else:
+                updates_coordinator.note_install_returned(update_entity)
             await updates_coordinator.async_request_refresh()
-
-        # (1.3.0) The broadened Trouble sensor's stuck-container check is
-        # stateless (re-derived from live entity state, see sensor.py's
-        # _find_stuck_containers), so it doesn't strictly need to be told
-        # this happened -- but nudging its own refresh here means the
-        # Trouble tab reflects it on the next moment rather than waiting
-        # out its own 1-minute poll interval.
-        trouble_coordinator = coordinators.get("trouble")
-        if needs_stack_restart and trouble_coordinator is not None:
-            await trouble_coordinator.async_request_refresh()
 
         for service in _notify_services_for_entry(hass, entry):
             domain, service_name = service.split(".", 1)
