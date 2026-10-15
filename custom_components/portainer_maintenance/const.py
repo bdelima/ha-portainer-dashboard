@@ -14,7 +14,7 @@ DOMAIN = "portainer_maintenance"
 # newer sidecar may start to rely on, the PATCH part for fixes behind the same
 # contract. The sidecar holds the lowest level it needs
 # (REQUIRED_DASHBOARD_API_LEVEL in its main.py) and compares it with this.
-API_LEVEL = "1.1.0"
+API_LEVEL = "1.2.0"
 
 
 def _running_version() -> str:
