@@ -74,20 +74,24 @@ UPDATES_CONFIRM_MAX_SECONDS = 420
 # "on" without ever having gone "on" -> "unknown" before the container is
 # called out of sync with Portainer's state. A real update flips through
 # "unknown" while the container restarts; one that does not is stuck until the
-# stack is restarted.
+# endpoint is reloaded (restarting its stack was tried and does not clear it).
 UPDATES_STUCK_WINDOW_SECONDS = 300
 
-# What a row says while it waits for a stack restart. Same wording for both
-# causes; the network_mode one adds its known reason.
+# What a row says while it waits for the fix it needs. Two causes, two fixes:
+# a container whose update entity never settled needs the endpoint reloaded
+# (a stack restart was tried and did not clear it); one stuck on the
+# network_mode:service:X conflict needs its stack restarted.
 AWAITING_RESTART_TEXT = "Awaiting stack restart"
 AWAITING_RESTART_DETAIL = (
     "Container was successfully updated, but is out of sync with Portainer's state. "
-    "Restart the stack at your earliest convenience."
+    "Restart the stack at your earliest convenience. (Its image reference has not settled: "
+    "a known Portainer/Docker limitation for containers that share another container's "
+    "network, network_mode: service:<other>.)"
 )
-AWAITING_RESTART_DETAIL_IMAGE_REFERENCE = (
-    AWAITING_RESTART_DETAIL
-    + " (Its image reference has not settled: a known Portainer/Docker limitation for "
-    "containers that share another container's network, network_mode: service:<other>.)"
+AWAITING_RELOAD_TEXT = "Awaiting endpoint reload"
+AWAITING_RELOAD_DETAIL = (
+    "Container was successfully updated, but is out of sync with Portainer's state. "
+    "Reload the endpoint at your earliest convenience."
 )
 
 # Cleanup: how long after a change to one of a host's source sensors the
@@ -353,26 +357,31 @@ def _awaiting_restart_item(
     container_device_id: str,
     reason: str,
 ) -> dict | None:
-    """A container whose update went through but whose stack still needs a
-    restart, as an item for the Updates sensor's `awaiting_restart` list. None
-    when the container is not in a stack: there is nothing to restart from here.
+    """A container whose update went through but that still needs a fix from
+    the person, as an item for the Updates sensor's `awaiting_restart` list.
+    None when the container is not in a stack (a stacked container is all that
+    is listed for now).
 
     `reason` is "out_of_sync" (the update entity never flipped, see
     PortainerUpdatesCoordinator) or "image_reference" (the known
-    network_mode:service:X conflict, see _find_stuck_containers)."""
+    network_mode:service:X conflict, see _find_stuck_containers). The item's
+    `remedy` says what clears it: "reload_endpoint" for out_of_sync (a stack
+    restart did not clear it), "restart_stack" for image_reference."""
     stack_name, switch_entity_id = _stack_info(device_reg, entity_reg, container_device_id)
     if not stack_name:
         return None
     root_id = _walk_to_root(device_reg, container_device_id)
     host = _device_name(device_reg, root_id) or "unknown host"
     container_name = _device_name(device_reg, container_device_id) or container_device_id
+    restart = reason == "image_reference"
     return {
         "entity": _container_update_entity_id(entity_reg, container_device_id),
         "device_id": container_device_id,
         "name": f"{container_name} ({host})",
-        "secondary_info": AWAITING_RESTART_TEXT,
-        "detail": AWAITING_RESTART_DETAIL_IMAGE_REFERENCE if reason == "image_reference" else AWAITING_RESTART_DETAIL,
+        "secondary_info": AWAITING_RESTART_TEXT if restart else AWAITING_RELOAD_TEXT,
+        "detail": AWAITING_RESTART_DETAIL if restart else AWAITING_RELOAD_DETAIL,
         "reason": reason,
+        "remedy": "restart_stack" if restart else "reload_endpoint",
         "host": host,
         "host_device_id": root_id,
         "stack_name": stack_name,
@@ -1070,8 +1079,9 @@ class PortainerUpdatesCoordinator(DataUpdateCoordinator[list[dict]]):
     (perform_update tells this coordinator when it starts, returns or fails).
     If core's entity never goes through "unknown" and is still "on"
     UPDATES_STUCK_WINDOW_SECONDS after the call returned, the container was
-    updated but Portainer's own record of it is out of sync, and a stack
-    restart clears that. It is then taken out of `items` and listed in the
+    updated but Portainer's own record of it is out of sync, and reloading the
+    endpoint clears that (a stack restart did not). It is then taken out of
+    `items` and listed in the
     `awaiting_restart` attribute instead, as is a stacked container stuck on
     the known network_mode:service:X conflict (see _find_stuck_containers).
     `items` stays "updates that can be installed", so the sensor's count and the
@@ -1362,7 +1372,7 @@ class PortainerUpdatesCoordinator(DataUpdateCoordinator[list[dict]]):
                 continue
 
             # The dashboard applied this update and core's entity never moved:
-            # not an update to install again, a stack restart to do.
+            # not an update to install again, an endpoint reload to do.
             if device_id is not None and self._is_out_of_sync(entity_id, state, now_loop):
                 awaiting = _awaiting_restart_item(entity_reg, device_reg, device_id, "out_of_sync")
                 if awaiting is not None:
@@ -1413,10 +1423,15 @@ class PortainerUpdatesCoordinator(DataUpdateCoordinator[list[dict]]):
 
         # A container awaiting a restart is not also an update to install.
         found = [i for i in found if device_by_entity.get(i["entity"]) not in awaiting_by_device]
-        awaiting_stacks = {a["stack_device_id"] for a in awaiting_by_device.values() if a["stack_device_id"]}
+        awaiting_stacks = {
+            a["stack_device_id"]
+            for a in awaiting_by_device.values()
+            if a["stack_device_id"] and a["remedy"] == "restart_stack"
+        }
         for item in found:
             # The webapp badges the stack's row, so installs in a stack that
-            # is owed a restart are not started blind.
+            # is owed a restart are not started blind. (A container owed an
+            # endpoint reload is shown on its endpoint's row instead.)
             item["stack_awaiting_restart"] = bool(item["stack_device_id"] and item["stack_device_id"] in awaiting_stacks)
         self.awaiting_restart = sorted(awaiting_by_device.values(), key=lambda a: (a["host"], a["stack_name"], a["name"]))
 
