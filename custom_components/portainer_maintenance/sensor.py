@@ -24,7 +24,7 @@ import logging
 import asyncio
 import re
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
@@ -104,6 +104,11 @@ CLEANUP_BACKSTOP_SECONDS = 300
 CLEANUP_READY = "ready"
 CLEANUP_COMPUTING = "computing"
 CLEANUP_UNAVAILABLE = "unavailable"
+# (1.3.0) How long a host stays "computing" after an install, stack restart or
+# endpoint reload on it has finished: core re-reads an endpoint every 60 s, and
+# the container/image counts Cleanup reads are only right again after that
+# next read. 90 s is one core poll plus a margin.
+CLEANUP_HOLD_SETTLE_SECONDS = 90
 
 
 # ---------------------------------------------------------------------------
@@ -1104,6 +1109,10 @@ class PortainerUpdatesCoordinator(DataUpdateCoordinator[list[dict]]):
         # Containers whose stack needs a restart; exposed as an attribute of
         # the sensor (see _PortainerListSensor).
         self.awaiting_restart: list[dict] = []
+        # Told whenever the set of installs in flight changes (the Cleanup
+        # coordinator holds those hosts at "computing" meanwhile).
+        self.on_in_flight_change: Callable[[], None] | None = None
+        self._last_in_flight: frozenset[str] = frozenset()
 
     # -- follow core's update entities -------------------------------------
 
@@ -1130,6 +1139,31 @@ class PortainerUpdatesCoordinator(DataUpdateCoordinator[list[dict]]):
         self._expiry_timer = None
         self._confirming.clear()
         self._applied.clear()
+        self._last_in_flight = frozenset()
+
+    def in_flight_entities(self) -> set[str]:
+        """Update entities whose container is being recreated right now: an
+        install the dashboard started whose recreate has not returned yet, or
+        one core is confirming (its entity went "on" -> "unknown" and has not
+        settled, for at most UPDATES_CONFIRM_MAX_SECONDS). While the old
+        container is gone and the new one is not yet there, the host's
+        container count is short, which is what the Cleanup numbers read."""
+        now_loop = self.hass.loop.time()
+        running = {entity for entity, applied in self._applied.items() if applied["returned"] is None}
+        confirming = {
+            entity for entity, started in self._confirming.items() if now_loop - started < UPDATES_CONFIRM_MAX_SECONDS
+        }
+        return running | confirming
+
+    @callback
+    def _notify_in_flight(self) -> None:
+        """Tell the listener (Cleanup) when the in-flight set changed."""
+        current = frozenset(self.in_flight_entities())
+        if current == self._last_in_flight:
+            return
+        self._last_in_flight = current
+        if self.on_in_flight_change is not None:
+            self.on_in_flight_change()
 
     @callback
     def _is_update_change(self, event_or_data: Any) -> bool:
@@ -1177,6 +1211,7 @@ class PortainerUpdatesCoordinator(DataUpdateCoordinator[list[dict]]):
                 # "unknown" and back to "on" (the install did not take, which
                 # is the plain "Update available" case).
                 self._applied.pop(entity_id, None)
+        self._notify_in_flight()
         self._schedule_scan(UPDATES_DEBOUNCE_SECONDS)
 
     # -- updates the dashboard itself runs (called by perform_update) ---------
@@ -1185,6 +1220,7 @@ class PortainerUpdatesCoordinator(DataUpdateCoordinator[list[dict]]):
     def note_install_started(self, entity_id: str) -> None:
         """perform_update is about to recreate this container."""
         self._applied[entity_id] = {"returned": None, "saw_unknown": False}
+        self._notify_in_flight()
 
     @callback
     def note_install_returned(self, entity_id: str) -> None:
@@ -1198,14 +1234,17 @@ class PortainerUpdatesCoordinator(DataUpdateCoordinator[list[dict]]):
             applied["saw_unknown"] = True
         elif state is None or state.state == "off":
             self._applied.pop(entity_id, None)
+            self._notify_in_flight()
             return
         applied["returned"] = self.hass.loop.time()
+        self._notify_in_flight()
         self._arm_expiry()
 
     @callback
     def note_install_failed(self, entity_id: str) -> None:
         """perform_update did not succeed: nothing was applied."""
         self._applied.pop(entity_id, None)
+        self._notify_in_flight()
 
     def _is_out_of_sync(self, entity_id: str, state: Any, now_loop: float) -> bool:
         """The update was applied, yet the entity never went through "unknown"
@@ -1436,6 +1475,7 @@ class PortainerUpdatesCoordinator(DataUpdateCoordinator[list[dict]]):
         self.awaiting_restart = sorted(awaiting_by_device.values(), key=lambda a: (a["host"], a["stack_name"], a["name"]))
 
         self._arm_expiry()
+        self._notify_in_flight()
         return found
 
 
@@ -2132,6 +2172,15 @@ class PortainerCleanupCoordinator(DataUpdateCoordinator[list[dict]]):
 
     Hosts are independent: one host that is down never holds back another.
 
+    A host is also "computing" (and its item carries `in_flight: true`, present
+    only while true) while an action is changing what is running on it, and for
+    CLEANUP_HOLD_SETTLE_SECONDS after, so core's next read has landed: an
+    install (the old container is removed before the new one exists), a
+    `restart_stack` or a `reload_endpoint`. During those the container count is
+    short, so every image looks unused and an image prune could remove an
+    image the stack is about to start again. The numbers returned are the raw
+    ones as before; `status` is what tells the webapp not to use them.
+
     Event driven, with a backstop. A change to any of a host's three source
     sensors re-reads everything after CLEANUP_DEBOUNCE_SECONDS (one timer for a
     burst, not extended by later changes), so a host becomes ready, and the
@@ -2140,8 +2189,19 @@ class PortainerCleanupCoordinator(DataUpdateCoordinator[list[dict]]):
     does the same. The backstop re-reads every CLEANUP_BACKSTOP_SECONDS anyway.
     """
 
-    def __init__(self, hass: HomeAssistant) -> None:
+    def __init__(
+        self, hass: HomeAssistant, in_flight_entities: Callable[[], set[str]] | None = None
+    ) -> None:
         super().__init__(hass, _LOGGER, name=SENSOR_CLEANUP, update_interval=None)
+        # Update entities being installed right now (see
+        # PortainerUpdatesCoordinator.in_flight_entities).
+        self._in_flight_entities = in_flight_entities
+        # endpoint device_id -> number of restart_stack / reload_endpoint runs in flight
+        self._explicit: dict[str, int] = {}
+        # endpoint device_id -> loop time its settle period ends
+        self._settle_until: dict[str, float] = {}
+        # endpoints that were held at the previous read
+        self._prev_active: set[str] = set()
         self._unsubs: list[CALLBACK_TYPE] = []
         self._timer: CALLBACK_TYPE | None = None
         self._timer_due = 0.0
@@ -2191,6 +2251,48 @@ class PortainerCleanupCoordinator(DataUpdateCoordinator[list[dict]]):
     @callback
     def _handle_source_change(self, _event: Any) -> None:
         self._schedule_scan(CLEANUP_DEBOUNCE_SECONDS)
+
+    # -- actions in flight -------------------------------------------------
+
+    @callback
+    def hold_endpoint(self, endpoint_device_id: str | None) -> None:
+        """A restart_stack or reload_endpoint run is starting on this endpoint:
+        report it as computing until release_endpoint and the settle period."""
+        if not endpoint_device_id:
+            return
+        self._explicit[endpoint_device_id] = self._explicit.get(endpoint_device_id, 0) + 1
+        self._settle_until.pop(endpoint_device_id, None)
+        self._schedule_scan(0)
+
+    @callback
+    def release_endpoint(self, endpoint_device_id: str | None) -> None:
+        """The run is over (it returned or raised). The endpoint stays computing
+        for CLEANUP_HOLD_SETTLE_SECONDS more."""
+        if not endpoint_device_id:
+            return
+        remaining = self._explicit.get(endpoint_device_id, 0) - 1
+        if remaining > 0:
+            self._explicit[endpoint_device_id] = remaining
+            return
+        self._explicit.pop(endpoint_device_id, None)
+        self._settle_until[endpoint_device_id] = self.hass.loop.time() + CLEANUP_HOLD_SETTLE_SECONDS
+        self._schedule_scan(0)
+
+    @callback
+    def note_in_flight_changed(self) -> None:
+        """An install started or ended (called by the Updates coordinator)."""
+        self._schedule_scan(0)
+
+    def _install_hosts(self, entity_reg: er.EntityRegistry, device_reg: dr.DeviceRegistry) -> set[str]:
+        hosts: set[str] = set()
+        if self._in_flight_entities is None:
+            return hosts
+        for entity_id in self._in_flight_entities():
+            entry = entity_reg.async_get(entity_id)
+            root = _walk_to_root(device_reg, entry.device_id) if entry is not None else None
+            if root:
+                hosts.add(root)
+        return hosts
 
     @callback
     def _handle_registry_updated(self, event: Any) -> None:
@@ -2242,6 +2344,20 @@ class PortainerCleanupCoordinator(DataUpdateCoordinator[list[dict]]):
         watched: set[str] = set()
         hosts_seen: set[str] = set()
 
+        # Hosts an action is changing right now, or finished changing less
+        # than CLEANUP_HOLD_SETTLE_SECONDS ago. A host that stopped being
+        # active since the last read (an install that ended) starts its
+        # settle period here; one that restarted being active ends it.
+        now_loop = self.hass.loop.time()
+        active = set(self._explicit) | self._install_hosts(entity_reg, device_reg)
+        for endpoint_device_id in self._prev_active - active:
+            self._settle_until.setdefault(endpoint_device_id, now_loop + CLEANUP_HOLD_SETTLE_SECONDS)
+        self._prev_active = active
+        self._settle_until = {
+            host: until for host, until in self._settle_until.items() if until > now_loop and host not in active
+        }
+        held = active | set(self._settle_until)
+
         for endpoint_device_id in _discover_endpoint_devices(entity_reg, device_reg):
             host = _device_name(device_reg, endpoint_device_id) or "unknown host"
             hosts_seen.add(endpoint_device_id)
@@ -2267,7 +2383,12 @@ class PortainerCleanupCoordinator(DataUpdateCoordinator[list[dict]]):
                 and _cleanup_source_ready(self.hass, containers_entity, unknown_is_value=False)
                 and _cleanup_source_ready(self.hass, reclaimable_entity, unknown_is_value=True)
             )
-            if ready:
+            in_flight = endpoint_device_id in held
+            if in_flight:
+                # Not ready whatever the sensors say, and never promoted to
+                # "unavailable" by a backstop read meanwhile.
+                status = CLEANUP_COMPUTING
+            elif ready:
                 status = CLEANUP_READY
                 self._unavailable_hosts.discard(endpoint_device_id)
             elif backstop or endpoint_device_id in self._unavailable_hosts:
@@ -2276,23 +2397,28 @@ class PortainerCleanupCoordinator(DataUpdateCoordinator[list[dict]]):
             else:
                 status = CLEANUP_COMPUTING
 
-            found.append(
-                {
-                    "host": host,
-                    "device_id": endpoint_device_id,
-                    "status": status,
-                    "images_count": images_count,
-                    "unused_estimate": unused_estimate,
-                    "reclaimable_mib": reclaimable_mib,
-                    "reclaimable_unavailable": reclaimable_unavailable,
-                    "volume_usage_mib": volume_usage_mib,
-                    "volumes_prune_button": volumes_prune_button,
-                    "refreshed_at": refreshed_at,
-                }
-            )
+            item = {
+                "host": host,
+                "device_id": endpoint_device_id,
+                "status": status,
+                "images_count": images_count,
+                "unused_estimate": unused_estimate,
+                "reclaimable_mib": reclaimable_mib,
+                "reclaimable_unavailable": reclaimable_unavailable,
+                "volume_usage_mib": volume_usage_mib,
+                "volumes_prune_button": volumes_prune_button,
+                "refreshed_at": refreshed_at,
+            }
+            if in_flight:
+                # Present only while true (older webapps ignore it).
+                item["in_flight"] = True
+            found.append(item)
 
         self._watched = watched
         self._unavailable_hosts &= hosts_seen
+        # Read again once the first settle period is over.
+        if self._settle_until:
+            self._schedule_scan(max(0.0, min(self._settle_until.values()) - now_loop) + 1)
         return found
 
 
@@ -2412,7 +2538,8 @@ async def async_setup_entry(
         hass, hass.data[DOMAIN][entry.entry_id].get("dismissals")
     )
     stale_coordinator = PortainerStaleCoordinator(hass)
-    cleanup_coordinator = PortainerCleanupCoordinator(hass)
+    cleanup_coordinator = PortainerCleanupCoordinator(hass, updates_coordinator.in_flight_entities)
+    updates_coordinator.on_in_flight_change = cleanup_coordinator.note_in_flight_changed
 
     await updates_coordinator.async_config_entry_first_refresh()
     await trouble_coordinator.async_config_entry_first_refresh()

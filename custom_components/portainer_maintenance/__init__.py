@@ -901,7 +901,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             portainer_entry_id,
             device_id,
         )
-        await hass.config_entries.async_reload(portainer_entry_id)
+        # (1.3.0) Cleanup reports this endpoint as computing while the reload
+        # runs and for a while after, so nothing is pruned from numbers that
+        # are about to change.
+        cleanup = (
+            hass.data.get(DOMAIN, {}).get(entry.entry_id, {}).get("coordinators", {}).get("cleanup")
+        )
+        endpoint_id = _walk_to_root(device_reg, device_id)
+        if cleanup is not None:
+            cleanup.hold_endpoint(endpoint_id)
+        try:
+            await hass.config_entries.async_reload(portainer_entry_id)
+        finally:
+            if cleanup is not None:
+                cleanup.release_endpoint(endpoint_id)
 
     if not hass.services.has_service(DOMAIN, SERVICE_RELOAD_ENDPOINT):
         hass.services.async_register(
@@ -1219,13 +1232,29 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     async def handle_restart_stack(call: ServiceCall) -> None:
         switch_entity_id = call.data["switch_entity_id"]
         _LOGGER.info("%s.restart_stack: restarting stack via %s", DOMAIN, switch_entity_id)
-        await hass.services.async_call(
-            "switch", "turn_off", {"entity_id": switch_entity_id}, blocking=True
+        # (1.3.0) While the stack is down its endpoint's container count is
+        # short, so Cleanup reports the endpoint as computing for the restart
+        # and a while after.
+        cleanup = (
+            hass.data.get(DOMAIN, {}).get(entry.entry_id, {}).get("coordinators", {}).get("cleanup")
         )
-        await asyncio.sleep(STACK_RESTART_SETTLE_SECONDS)
-        await hass.services.async_call(
-            "switch", "turn_on", {"entity_id": switch_entity_id}, blocking=True
+        switch_entry = er.async_get(hass).async_get(switch_entity_id)
+        endpoint_id = (
+            _walk_to_root(dr.async_get(hass), switch_entry.device_id) if switch_entry is not None else None
         )
+        if cleanup is not None:
+            cleanup.hold_endpoint(endpoint_id)
+        try:
+            await hass.services.async_call(
+                "switch", "turn_off", {"entity_id": switch_entity_id}, blocking=True
+            )
+            await asyncio.sleep(STACK_RESTART_SETTLE_SECONDS)
+            await hass.services.async_call(
+                "switch", "turn_on", {"entity_id": switch_entity_id}, blocking=True
+            )
+        finally:
+            if cleanup is not None:
+                cleanup.release_endpoint(endpoint_id)
 
     if not hass.services.has_service(DOMAIN, SERVICE_RESTART_STACK):
         hass.services.async_register(
